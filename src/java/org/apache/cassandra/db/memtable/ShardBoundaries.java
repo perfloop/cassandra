@@ -68,7 +68,7 @@ public class ShardBoundaries
     {
         Token[] bounds = boundaries;
         int len = bounds.length;
-        if (len < 128)
+        if (len < 32)
         {
             for (int i = 0; i < len; i++)
             {

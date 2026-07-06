@@ -148,4 +148,40 @@ public class ShardBoundariesTest
             runDifferentialTest(boundaries, lookupTokens);
         }
     }
+
+    @Test
+    public void testLargeBoundariesWithDuplicates()
+    {
+        // Generate a boundaries array of size 200 (length >= 128) containing duplicates
+        Token t1 = partitioner.split(minimumToken, minimumToken, 0.2);
+        Token t2 = partitioner.split(minimumToken, minimumToken, 0.5);
+        Token t3 = partitioner.split(minimumToken, minimumToken, 0.8);
+
+        Token[] boundaries = new Token[200];
+        // Fill the array with duplicates and sequential values
+        for (int i = 0; i < 50; i++)
+        {
+            boundaries[i] = t1;
+        }
+        for (int i = 50; i < 120; i++)
+        {
+            boundaries[i] = t2;
+        }
+        for (int i = 120; i < 200; i++)
+        {
+            boundaries[i] = t3;
+        }
+
+        Token[] lookupTokens = new Token[] {
+            partitioner.split(minimumToken, minimumToken, 0.1),
+            t1,
+            partitioner.split(minimumToken, minimumToken, 0.3),
+            t2,
+            partitioner.split(minimumToken, minimumToken, 0.6),
+            t3,
+            partitioner.split(minimumToken, minimumToken, 0.9)
+        };
+
+        runDifferentialTest(boundaries, lookupTokens);
+    }
 }
