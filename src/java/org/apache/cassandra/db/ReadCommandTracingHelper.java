@@ -26,13 +26,16 @@ public class ReadCommandTracingHelper
 {
     public static void traceIndexQueryPlan(String keyspace, String tableName, Index.QueryPlan indexQueryPlan)
     {
-        Tracing.trace("Executing read on {}.{} using index{} {}",
-                      keyspace,
-                      tableName,
-                      indexQueryPlan.getIndexes().size() == 1 ? "" : "es",
-                      indexQueryPlan.getIndexes()
-                                    .stream()
-                                    .map(i -> i.getIndexMetadata().name)
-                                    .collect(Collectors.joining(",")));
+        if (Tracing.isTracing())
+        {
+            Tracing.trace("Executing read on {}.{} using index{} {}",
+                          keyspace,
+                          tableName,
+                          indexQueryPlan.getIndexes().size() == 1 ? "" : "es",
+                          indexQueryPlan.getIndexes()
+                                        .stream()
+                                        .map(i -> i.getIndexMetadata().name)
+                                        .collect(Collectors.joining(",")));
+        }
     }
 }
