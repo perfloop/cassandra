@@ -66,8 +66,37 @@ public class ShardBoundaries
      */
     public int getShardForToken(Token tk)
     {
-        int idx = Arrays.binarySearch(boundaries, tk);
-        return idx >= 0 ? idx : -idx - 1;
+        Token[] bounds = boundaries;
+        int len = bounds.length;
+        if (len < 128)
+        {
+            for (int i = 0; i < len; i++)
+            {
+                if (tk.compareTo(bounds[i]) <= 0) // boundaries are end-inclusive
+                    return i;
+            }
+            return len;
+        }
+        else
+        {
+            int low = 0;
+            int high = len - 1;
+            int result = len;
+            while (low <= high)
+            {
+                int mid = (low + high) >>> 1;
+                if (tk.compareTo(bounds[mid]) <= 0)
+                {
+                    result = mid;
+                    high = mid - 1;
+                }
+                else
+                {
+                    low = mid + 1;
+                }
+            }
+            return result;
+        }
     }
 
     /**
