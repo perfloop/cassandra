@@ -521,14 +521,17 @@ public abstract class ReadCommand extends AbstractReadQuery
                 cfs.indexManager.checkQueryability(indexQueryPlan);
 
                 searcher = indexQueryPlan.searcherFor(this);
-                Tracing.trace("Executing read on {}.{} using index{} {}",
-                              cfs.metadata.keyspace,
-                              cfs.metadata.name,
-                              indexQueryPlan.getIndexes().size() == 1 ? "" : "es",
-                              indexQueryPlan.getIndexes()
-                                            .stream()
-                                            .map(i -> i.getIndexMetadata().name)
-                                            .collect(Collectors.joining(",")));
+                if (Tracing.isTracing())
+                {
+                    Tracing.trace("Executing read on {}.{} using index{} {}",
+                                  cfs.metadata.keyspace,
+                                  cfs.metadata.name,
+                                  indexQueryPlan.getIndexes().size() == 1 ? "" : "es",
+                                  indexQueryPlan.getIndexes()
+                                                .stream()
+                                                .map(i -> i.getIndexMetadata().name)
+                                                .collect(Collectors.joining(",")));
+                }
             }
 
             UnfilteredPartitionIterator iterator = (null == searcher) ? queryStorage(cfs, executionController) : searcher.search(executionController);
