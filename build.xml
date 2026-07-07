@@ -666,7 +666,12 @@
         The build target builds all the .class files
     -->
     <target name="_build_subprojects" depends="_build-accord" description="Builds all subprojects needed for the build" />
-    <target name="build" depends="resolver-retrieve-build,_build_subprojects,build-project" description="Compile Cassandra classes"/>
+    <target name="build" depends="resolver-retrieve-build,_build_subprojects,build-project" description="Compile Cassandra classes">
+        <mkdir dir="build/test/lib/jars"/>
+        <copy todir="build/test/lib/jars" failonerror="false">
+            <fileset dir="build/lib/jars"/>
+        </copy>
+    </target>
     <target name="codecoverage" depends="jacoco-run,jacoco-report" description="Create code coverage report"/>
 
     <target name="_build_java">
@@ -1244,6 +1249,9 @@
     <!-- Non-java resources needed by the test suite -->
     <copy todir="${test.classes}">
       <fileset dir="${test.resources}"/>
+    </copy>
+    <copy todir="build/test/lib/jars" failonerror="false">
+      <fileset dir="build/lib/jars"/>
     </copy>
   </target>
 

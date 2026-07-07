@@ -26,11 +26,6 @@
         <arg value="copyDependencies" /> <!-- For IDE support -->
         <arg value="publishToMavenLocal" />
         <arg value="-x" />
-        <arg value="test" />
-        <!-- Disable rat/checkstyle as C*'s logic will include the accord source -->
-        <arg value="-x" />
-        <arg value="rat" />
-        <arg value="-x" />
         <arg value="checkstyleMain" />
         <arg value="-x" />
         <arg value="checkstyleTest" />
