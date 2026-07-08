@@ -43,9 +43,9 @@ public class MergeIteratorBench
         @Override public ColumnData updateAllTimestamp(long timestamp) { return this; }
         @Override public ColumnData updateTimesAndPathsForAccord(Function<Cell, CellPath> cellToMaybeNewListPath, long newTimestamp, long newLocalDeletionTime) { return this; }
         @Override public ColumnData updateAllTimesWithNewCellPathForComplexColumnData(CellPath maybeNewPath, long newTimestamp, long newLocalDeletionTime) { return this; }
-        @Override public ColumnData markCounterLocalToBeCleared() { return this; }
-        @Override public ColumnData purge(DeletionPurger purger, long nowInSec) { return this; }
-        @Override public ColumnData purgeDataOlderThan(long timestamp) { return this; }
+        @Override public Cell<?> markCounterLocalToBeCleared() { return this; }
+        @Override public Cell<?> purge(DeletionPurger purger, long nowInSec) { return this; }
+        @Override public Cell<?> purgeDataOlderThan(long timestamp) { return this; }
         @Override public long maxTimestamp() { return 0; }
 
         @Override public boolean isCounterCell() { return false; }
