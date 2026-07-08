@@ -85,4 +85,10 @@ public abstract class AbstractIterator<V> implements Iterator<V>, PeekingIterato
     {
         //no-op
     }
+
+    public void reset()
+    {
+        this.state = State.MUST_FETCH;
+        this.next = null;
+    }
 }

@@ -145,9 +145,10 @@ public abstract class MergeIterator<In,Out> extends AbstractIterator<Out> implem
      *
      * For more formal definitions and proof of correctness, see CASSANDRA-8915.
      */
-    static final class ManyToOne<In,Out> extends MergeIterator<In,Out>
+    public static final class ManyToOne<In,Out> extends MergeIterator<In,Out>
     {
         protected final Candidate<In>[] heap;
+        private final Candidate<In>[] candidatesPool;
 
         private final Comparator<? super In> comp;
 
@@ -174,6 +175,11 @@ public abstract class MergeIterator<In,Out> extends AbstractIterator<Out> implem
             @SuppressWarnings("unchecked")
             Candidate<In>[] heap = new Candidate[iters.size()];
             this.heap = heap;
+
+            @SuppressWarnings("unchecked")
+            Candidate<In>[] candidatesPool = new Candidate[iters.size()];
+            this.candidatesPool = candidatesPool;
+
             size = 0;
 
             this.comp = comp;
@@ -181,8 +187,22 @@ public abstract class MergeIterator<In,Out> extends AbstractIterator<Out> implem
             {
                 Candidate<In> candidate = new Candidate<>(i, iters.get(i));
                 heap[size++] = candidate;
+                candidatesPool[i] = candidate;
             }
             needingAdvance = size;
+        }
+
+        public void reset()
+        {
+            super.reset();
+            this.size = this.iterators.size();
+            for (int i = 0; i < this.size; i++)
+            {
+                Candidate<In> candidate = candidatesPool[i];
+                candidate.reset(this.iterators.get(i));
+                heap[i] = candidate;
+            }
+            this.needingAdvance = this.size;
         }
 
         protected final Out computeNext()
@@ -382,7 +402,7 @@ public abstract class MergeIterator<In,Out> extends AbstractIterator<Out> implem
     // Holds and is comparable by the head item of an iterator it owns
     protected static final class Candidate<In>
     {
-        private final Iterator<? extends In> iter;
+        private Iterator<? extends In> iter;
         private final int idx;
         private In item;
         private In lowerBound;
@@ -393,6 +413,14 @@ public abstract class MergeIterator<In,Out> extends AbstractIterator<Out> implem
             this.iter = iter;
             this.idx = idx;
             this.lowerBound = iter instanceof IteratorWithLowerBound ? ((IteratorWithLowerBound<In>)iter).lowerBound() : null;
+        }
+
+        public void reset(Iterator<? extends In> iter)
+        {
+            this.iter = iter;
+            this.item = null;
+            this.lowerBound = iter instanceof IteratorWithLowerBound ? ((IteratorWithLowerBound<In>)iter).lowerBound() : null;
+            this.equalParent = false;
         }
 
         /** @return this if our iterator had an item, and it is now available, otherwise null */

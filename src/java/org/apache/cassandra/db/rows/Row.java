@@ -713,6 +713,7 @@ public interface Row extends Unfiltered, Iterable<ColumnData>, IMeasurableMemory
     {
         private final Row[] rows;
         private final List<Iterator<ColumnData>> columnDataIterators;
+        private MergeIterator.ManyToOne<ColumnData, ColumnData> manyToOneMergeIterator;
 
         private Clustering<?> clustering;
         private int rowsToMerge;
@@ -802,7 +803,23 @@ public interface Row extends Unfiltered, Iterable<ColumnData>, IMeasurableMemory
                 dataBuffer = new ColumnData[columnsCountEstimation];
 
             columnDataReducer.setActiveDeletion(activeDeletion);
-            Iterator<ColumnData> merged = MergeIterator.get(columnDataIterators, ColumnData.comparator, columnDataReducer);
+            Iterator<ColumnData> merged;
+            if (columnDataIterators.size() == 1)
+            {
+                merged = MergeIterator.get(columnDataIterators, ColumnData.comparator, columnDataReducer);
+            }
+            else
+            {
+                if (manyToOneMergeIterator == null)
+                {
+                    manyToOneMergeIterator = new MergeIterator.ManyToOne<>(columnDataIterators, ColumnData.comparator, columnDataReducer);
+                }
+                else
+                {
+                    manyToOneMergeIterator.reset();
+                }
+                merged = manyToOneMergeIterator;
+            }
             while (merged.hasNext())
             {
                 ColumnData data = merged.next();
