@@ -9,6 +9,7 @@ import com.sun.management.ThreadMXBean;
 import java.lang.management.ManagementFactory;
 
 import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.Digest;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.rows.Row;
