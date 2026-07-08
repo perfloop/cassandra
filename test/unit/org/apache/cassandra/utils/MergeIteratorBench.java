@@ -23,6 +23,7 @@ import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.ByteBufferAccessor;
 import org.apache.cassandra.db.marshal.ValueAccessor;
 import org.apache.cassandra.utils.memory.Cloner;
+import org.apache.cassandra.utils.memory.ByteBufferCloner;
 
 public class MergeIteratorBench
 {
@@ -63,6 +64,7 @@ public class MergeIteratorBench
         @Override public Cell<?> withUpdatedTimestampAndLocalDeletionTime(long newTimestamp, long newLocalDeletionTime) { return this; }
         @Override public Cell<?> withSkippedValue() { return this; }
         @Override protected int localDeletionTimeAsUnsignedInt() { return NO_DELETION_TIME_UNSIGNED_INTEGER; }
+        @Override public Cell<?> clone(ByteBufferCloner cloner) { return this; }
     }
 
     public static Row mockRow(Clustering<?> clustering, List<ColumnData> columnData)
