@@ -1,18 +1,83 @@
 package org.apache.cassandra.utils;
 
+import java.nio.ByteBuffer;
+import java.lang.reflect.Proxy;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
-import com.google.common.collect.Ordering;
 import com.sun.management.ThreadMXBean;
 import java.lang.management.ManagementFactory;
 
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.DeletionTime;
+import org.apache.cassandra.db.LivenessInfo;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.ColumnData;
+import org.apache.cassandra.db.rows.CellPath;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.utils.memory.Cloner;
+
 public class MergeIteratorBench
 {
-    private static final List<String> src1 = Arrays.asList("1", "3", "5", "7", "9");
-    private static final List<String> src2 = Arrays.asList("2", "4", "6", "8", "10");
-    private static final List<String> src3 = Arrays.asList("3", "4", "5", "6", "7");
-    private static final List<String> src4 = Arrays.asList("1", "2", "3", "4", "5");
+    static class MockColumnData extends ColumnData
+    {
+        private final ColumnMetadata column;
+
+        public MockColumnData(ColumnMetadata column)
+        {
+            super();
+            this.column = column;
+        }
+
+        @Override
+        public ColumnMetadata column()
+        {
+            return column;
+        }
+
+        @Override public int dataSize() { return 0; }
+        @Override public long unsharedHeapSizeExcludingData() { return 0; }
+        @Override public long unsharedHeapSize() { return 0; }
+        @Override public void validate() {}
+        @Override public boolean hasInvalidDeletions() { return false; }
+        @Override public void digest(Digest digest) {}
+        @Override public ColumnData clone(Cloner cloner) { return this; }
+        @Override public long estimateCloneSize(Cloner cloner) { return 0; }
+        @Override public void updateAllTimestamp(long timestamp) {}
+        @Override public void updateTimesAndPathsForAccord(long timestamp, long rts, long wts) {}
+        @Override public void updateAllTimesWithNewCellPathForComplexColumnData(CellPath path) {}
+        @Override public void markCounterLocalToBeCleared() {}
+        @Override public void purge(DeletionTime activeDeletion, long nowInSec, boolean keepDeletedColumns) {}
+        @Override public void purgeDataOlderThan(long timestamp) {}
+        @Override public long maxTimestamp() { return 0; }
+    }
+
+    public static Row mockRow(Clustering<?> clustering, List<ColumnData> columnData)
+    {
+        return (Row) Proxy.newProxyInstance(
+            Row.class.getClassLoader(),
+            new Class<?>[]{Row.class},
+            (proxy, method, args) -> {
+                if (method.getName().equals("clustering")) {
+                    return clustering;
+                } else if (method.getName().equals("primaryKeyLivenessInfo")) {
+                    return LivenessInfo.EMPTY;
+                } else if (method.getName().equals("deletion")) {
+                    return Row.Deletion.LIVE;
+                } else if (method.getName().equals("iterator")) {
+                    return columnData.iterator();
+                } else if (method.getName().equals("columnCount")) {
+                    return columnData.size();
+                } else if (method.getName().equals("isEmpty")) {
+                    return columnData.isEmpty();
+                } else if (method.getName().equals("toString") && (args == null || args.length == 0)) {
+                    return "MockRow";
+                }
+                return null;
+            }
+        );
+    }
 
     public static void main(String[] args)
     {
@@ -24,14 +89,27 @@ public class MergeIteratorBench
         }
         threadMXBean.setThreadAllocatedMemoryEnabled(true);
 
+        // Prepare test metadata
+        ColumnMetadata col1 = ColumnMetadata.regularColumn("ks", "tbl", "col1", Int32Type.instance, 0);
+        ColumnMetadata col2 = ColumnMetadata.regularColumn("ks", "tbl", "col2", Int32Type.instance, 1);
+        ColumnMetadata col3 = ColumnMetadata.regularColumn("ks", "tbl", "col3", Int32Type.instance, 2);
+
+        List<ColumnData> data1 = Arrays.asList(new MockColumnData(col1), new MockColumnData(col3));
+        List<ColumnData> data2 = Arrays.asList(new MockColumnData(col2), new MockColumnData(col3));
+
+        Row row1 = mockRow(Clustering.EMPTY, data1);
+        Row row2 = mockRow(Clustering.EMPTY, data2);
+
+        Row.Merger merger = new Row.Merger(2, false);
+
         // JIT Warmup
         int warmupRuns = 20000;
-        int blackhole = runMerge(warmupRuns);
+        int blackhole = runMerge(merger, row1, row2, warmupRuns);
 
         // Measurement run
         int count = 50000;
         long startBytes = threadMXBean.getThreadAllocatedBytes(Thread.currentThread().getId());
-        blackhole += runMerge(count);
+        blackhole += runMerge(merger, row1, row2, count);
         long endBytes = threadMXBean.getThreadAllocatedBytes(Thread.currentThread().getId());
 
         double bytesPerOp = (double) (endBytes - startBytes) / count;
@@ -44,40 +122,19 @@ public class MergeIteratorBench
         System.out.printf("{\"metric\":\"B/op\",\"value\":%.2f}%n", bytesPerOp);
     }
 
-    private static int runMerge(int count)
+    private static int runMerge(Row.Merger merger, Row row1, Row row2, int count)
     {
         int blackhole = 0;
         for (int i = 0; i < count; i++)
         {
-            MergeIterator.Reducer<String, String> reducer = new MergeIterator.Reducer<String, String>()
+            merger.clear();
+            merger.add(0, row1);
+            merger.add(1, row2);
+            Row merged = merger.merge(DeletionTime.LIVE);
+            if (merged != null)
             {
-                String concatted = "";
-
-                @Override
-                public void reduce(int idx, String current)
-                {
-                    concatted += current;
-                }
-
-                public String getReduced()
-                {
-                    String tmp = concatted;
-                    concatted = "";
-                    return tmp;
-                }
-            };
-
-            IMergeIterator<String, String> smi = MergeIterator.get(
-                Arrays.asList(src1.iterator(), src2.iterator(), src3.iterator(), src4.iterator()),
-                Ordering.<String>natural(),
-                reducer
-            );
-
-            while (smi.hasNext())
-            {
-                blackhole += smi.next().hashCode();
+                blackhole += merged.columnCount();
             }
-            smi.close();
         }
         return blackhole;
     }
