@@ -5,9 +5,11 @@ import java.lang.reflect.Proxy;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
+import java.util.function.Function;
 import com.google.common.base.Function;
 import com.sun.management.ThreadMXBean;
 import java.lang.management.ManagementFactory;
+import java.util.concurrent.ThreadLocalRandom;
 
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.Digest;
@@ -103,47 +105,51 @@ public class MergeIteratorBench
         }
         threadMXBean.setThreadAllocatedMemoryEnabled(true);
 
-        // Prepare test metadata
-        ColumnMetadata col1 = ColumnMetadata.regularColumn("ks", "tbl", "col1", Int32Type.instance, 0);
-        ColumnMetadata col2 = ColumnMetadata.regularColumn("ks", "tbl", "col2", Int32Type.instance, 1);
-        ColumnMetadata col3 = ColumnMetadata.regularColumn("ks", "tbl", "col3", Int32Type.instance, 2);
-
-        List<ColumnData> data1 = Arrays.asList(new MockColumnData(col1), new MockColumnData(col3));
-        List<ColumnData> data2 = Arrays.asList(new MockColumnData(col2), new MockColumnData(col3));
-
-        Row row1 = mockRow(Clustering.EMPTY, data1);
-        Row row2 = mockRow(Clustering.EMPTY, data2);
+        // Pre-allocate 50 mock rows of different sizes
+        Row[] mockRows = new Row[50];
+        for (int i = 0; i < 50; i++)
+        {
+            int cols = 2 + (i % 14); // 2 to 15 columns
+            MockColumnData[] data = new MockColumnData[cols];
+            for (int c = 0; c < cols; c++)
+            {
+                ColumnMetadata column = ColumnMetadata.regularColumn("ks", "tbl", "col" + c, Int32Type.instance, c);
+                data[c] = new MockColumnData(column);
+            }
+            mockRows[i] = mockRow(Clustering.EMPTY, Arrays.asList(data));
+        }
 
         Row.Merger merger = new Row.Merger(2, false);
 
         // JIT Warmup
         int warmupRuns = 20000;
-        int blackhole = runMerge(merger, row1, row2, warmupRuns);
+        int blackhole = runMerge(merger, mockRows, warmupRuns);
 
         // Measurement run
-        int count = 50000;
+        int count = 50000 + ThreadLocalRandom.current().nextInt(100);
         long startBytes = threadMXBean.getThreadAllocatedBytes(Thread.currentThread().getId());
-        blackhole += runMerge(merger, row1, row2, count);
+        blackhole += runMerge(merger, mockRows, count);
         long endBytes = threadMXBean.getThreadAllocatedBytes(Thread.currentThread().getId());
 
         double bytesPerOp = (double) (endBytes - startBytes) / count;
 
-        // Prevent dead-code elimination
-        if (blackhole == 0) {
-            System.out.println("No-op");
-        }
+        // Prevent dead-code elimination by outputting to stderr
+        System.err.println("DCE Sentinel: " + blackhole);
 
         System.out.printf("{\"metric\":\"B/op\",\"value\":%.2f}%n", bytesPerOp);
     }
 
-    private static int runMerge(Row.Merger merger, Row row1, Row row2, int count)
+    private static int runMerge(Row.Merger merger, Row[] mockRows, int count)
     {
         int blackhole = 0;
+        ThreadLocalRandom rand = ThreadLocalRandom.current();
         for (int i = 0; i < count; i++)
         {
+            int idx1 = rand.nextInt(50);
+            int idx2 = rand.nextInt(50);
             merger.clear();
-            merger.add(0, row1);
-            merger.add(1, row2);
+            merger.add(0, mockRows[idx1]);
+            merger.add(1, mockRows[idx2]);
             Row merged = merger.merge(DeletionTime.LIVE);
             if (merged != null)
             {
