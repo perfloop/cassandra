@@ -232,17 +232,142 @@ public abstract class ReadResponse
         private static final int bufferInitialSizeMin = CassandraRelevantProperties.DATA_RESPONSE_BUFFER_INITIAL_SIZE_MIN.getInt();
         private static final int bufferInitialSizeMax = CassandraRelevantProperties.DATA_RESPONSE_BUFFER_INITIAL_SIZE_MAX.getInt();
 
+        private final TableMetadata metadata;
+        private final ColumnFilter selection;
+        private final java.util.List<MaterializedPartition> materialized;
+        private final ByteBuffer repairedDataDigest;
+        private final boolean isRepairedDigestConclusive;
+        private ByteBuffer serializedData;
+
+        private static class MaterializedPartition
+        {
+            private final DecoratedKey partitionKey;
+            private final DeletionTime partitionLevelDeletion;
+            private final RegularAndStaticColumns columns;
+            private final org.apache.cassandra.db.rows.Row staticRow;
+            private final boolean isReverseOrder;
+            private final org.apache.cassandra.db.rows.EncodingStats stats;
+            private final java.util.List<org.apache.cassandra.db.rows.Unfiltered> unfiltereds;
+
+            private MaterializedPartition(UnfilteredRowIterator iterator)
+            {
+                this.partitionKey = iterator.partitionKey();
+                this.partitionLevelDeletion = iterator.partitionLevelDeletion();
+                this.columns = iterator.columns();
+                this.staticRow = iterator.staticRow();
+                this.isReverseOrder = iterator.isReverseOrder();
+                this.stats = iterator.stats();
+                this.unfiltereds = new java.util.ArrayList<>();
+                while (iterator.hasNext())
+                    this.unfiltereds.add(iterator.next());
+                iterator.close();
+            }
+
+            private UnfilteredRowIterator toIterator(TableMetadata metadata)
+            {
+                return new org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator(metadata,
+                                                         partitionKey,
+                                                         partitionLevelDeletion,
+                                                         columns,
+                                                         staticRow,
+                                                         isReverseOrder,
+                                                         stats)
+                {
+                    private final java.util.Iterator<org.apache.cassandra.db.rows.Unfiltered> iter = unfiltereds.iterator();
+
+                    @Override
+                    protected org.apache.cassandra.db.rows.Unfiltered computeNext()
+                    {
+                        return iter.hasNext() ? iter.next() : endOfData();
+                    }
+                };
+            }
+        }
+
+        private static java.util.List<MaterializedPartition> materialize(UnfilteredPartitionIterator iterator)
+        {
+            java.util.List<MaterializedPartition> result = new java.util.ArrayList<>();
+            while (iterator.hasNext())
+            {
+                result.add(new MaterializedPartition(iterator.next()));
+            }
+            iterator.close();
+            return result;
+        }
+
+        private static UnfilteredPartitionIterator toPartitionIterator(java.util.List<MaterializedPartition> materialized, TableMetadata metadata)
+        {
+            return new UnfilteredPartitionIterator()
+            {
+                private final java.util.Iterator<MaterializedPartition> iter = materialized.iterator();
+
+                public TableMetadata metadata()
+                {
+                    return metadata;
+                }
+
+                public boolean hasNext()
+                {
+                    return iter.hasNext();
+                }
+
+                public UnfilteredRowIterator next()
+                {
+                    return iter.next().toIterator(metadata);
+                }
+
+                public void close()
+                {
+                }
+            };
+        }
+
         private LocalDataResponse(UnfilteredPartitionIterator iter, ReadCommand command, RepairedDataInfo rdi)
         {
-            super(build(iter, command.columnFilter()),
-                  rdi.getDigest(), rdi.isConclusive(),
-                  MessagingService.current_version,
-                  DeserializationHelper.Flag.LOCAL);
+            super(null, null, false, MessagingService.current_version, DeserializationHelper.Flag.LOCAL);
+            this.metadata = iter.metadata();
+            this.selection = command.columnFilter();
+            this.materialized = materialize(iter);
+            this.repairedDataDigest = rdi.getDigest();
+            this.isRepairedDigestConclusive = rdi.isConclusive();
         }
 
         private LocalDataResponse(UnfilteredPartitionIterator iter, ColumnFilter selection)
         {
-            super(build(iter, selection), null, false, MessagingService.current_version, DeserializationHelper.Flag.LOCAL);
+            super(null, null, false, MessagingService.current_version, DeserializationHelper.Flag.LOCAL);
+            this.metadata = iter.metadata();
+            this.selection = selection;
+            this.materialized = materialize(iter);
+            this.repairedDataDigest = null;
+            this.isRepairedDigestConclusive = false;
+        }
+
+        @Override
+        public UnfilteredPartitionIterator makeIterator(ReadCommand command)
+        {
+            return toPartitionIterator(materialized, command.metadata());
+        }
+
+        @Override
+        public ByteBuffer repairedDataDigest()
+        {
+            return repairedDataDigest;
+        }
+
+        @Override
+        public boolean isRepairedDigestConclusive()
+        {
+            return isRepairedDigestConclusive;
+        }
+
+        @Override
+        protected ByteBuffer data()
+        {
+            if (serializedData == null)
+            {
+                serializedData = build(toPartitionIterator(materialized, metadata), selection);
+            }
+            return serializedData;
         }
 
         private static ByteBuffer build(UnfilteredPartitionIterator iter, ColumnFilter selection)
@@ -307,9 +432,14 @@ public abstract class ReadResponse
             this.flag = flag;
         }
 
+        protected ByteBuffer data()
+        {
+            return data;
+        }
+
         public UnfilteredPartitionIterator makeIterator(ReadCommand command)
         {
-            try (DataInputBuffer in = new DataInputBuffer(data, true))
+            try (DataInputBuffer in = new DataInputBuffer(data(), true))
             {
                 // Note that the command parameter shadows the 'command' field and this is intended because
                 // the later can be null (for RemoteDataResponse as those are created in the serializers and
@@ -378,7 +508,7 @@ public abstract class ReadResponse
                 ByteBufferUtil.writeWithVIntLength(response.repairedDataDigest(), out);
                 out.writeBoolean(response.isRepairedDigestConclusive());
 
-                ByteBuffer data = ((DataResponse)response).data;
+                ByteBuffer data = ((DataResponse)response).data();
                 ByteBufferUtil.writeWithVIntLength(data, out);
             }
         }
@@ -418,7 +548,7 @@ public abstract class ReadResponse
                 // In theory, we should deserialize/re-serialize if the version asked is different from the current
                 // version as the content could have a different serialization format. So far though, we haven't made
                 // change to partition iterators serialization since 3.0 so we skip this.
-                ByteBuffer data = ((DataResponse)response).data;
+                ByteBuffer data = ((DataResponse)response).data();
                 size += ByteBufferUtil.serializedSizeWithVIntLength(data);
             }
             return size;
