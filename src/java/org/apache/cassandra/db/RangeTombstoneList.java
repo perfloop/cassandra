@@ -48,6 +48,13 @@ import org.apache.cassandra.utils.memory.ByteBufferCloner;
  * <p>
  * The only use of the local deletion time is to know when a given tombstone can
  * be purged, which will be done by the purge() method.
+ * <p>
+ * <b>Copy-on-Write (COW) Invariant:</b>
+ * This class implements a copy-on-write optimization. The {@link #copy()} method creates a new instance 
+ * that shares the four parallel backing arrays ({@code starts}, {@code ends}, {@code markedAts}, 
+ * and {@code delTimesUnsignedIntegers}) with the original instance and marks both instances as shared ({@code shared = true}).
+ * To ensure safe copy independence, any operation that performs in-place mutation of these backing arrays 
+ * MUST call {@link #isolate()} before writing to them for the first time.
  */
 public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurableMemory
 {
@@ -116,6 +123,16 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         return comparator;
     }
 
+    /**
+     * Creates a copy-on-write duplicate of this list.
+     * <p>
+     * This method shares the four backing arrays ({@code starts}, {@code ends}, {@code markedAts}, and
+     * {@code delTimesUnsignedIntegers}) between the original list and the returned copy, marking both instances
+     * as shared ({@code shared = true}). To maintain independent states, any subsequent in-place mutation on
+     * either instance must first trigger {@link #isolate()} to copy and isolate the backing arrays before writing.
+     *
+     * @return a copy-on-write copy of this list.
+     */
     public RangeTombstoneList copy()
     {
         this.shared = true;
@@ -553,17 +570,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         return result;
     }
 
-    private static void copyArrays(RangeTombstoneList src, RangeTombstoneList dst)
-    {
-        dst.grow(src.size);
-        System.arraycopy(src.starts, 0, dst.starts, 0, src.size);
-        System.arraycopy(src.ends, 0, dst.ends, 0, src.size);
-        System.arraycopy(src.markedAts, 0, dst.markedAts, 0, src.size);
-        System.arraycopy(src.delTimesUnsignedIntegers, 0, dst.delTimesUnsignedIntegers, 0, src.size);
-        dst.size = src.size;
-        dst.boundaryHeapSize = src.boundaryHeapSize;
-    }
-
     /*
      * Inserts a new element starting at index i. This method assumes that:
      *    ends[i-1] <= start < ends[i]
@@ -727,15 +733,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
             newLength = ((capacity() * 3) / 2) + 1;
         
         grow(i, newLength);
-    }
-
-    /*
-     * Grow the arrays to match newLength capacity.
-     */
-    private void grow(int newLength)
-    {
-        if (capacity() < newLength)
-            grow(-1, newLength);
     }
 
     private void grow(int i, int newLength)
