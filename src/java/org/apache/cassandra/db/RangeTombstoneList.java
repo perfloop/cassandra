@@ -54,7 +54,7 @@ import org.apache.cassandra.utils.memory.ByteBufferCloner;
  * that shares the four parallel backing arrays ({@code starts}, {@code ends}, {@code markedAts}, 
  * and {@code delTimesUnsignedIntegers}) with the original instance and marks both instances as shared ({@code shared = true}).
  * To ensure safe copy independence, any operation that performs in-place mutation of these backing arrays 
- * MUST call {@link #isolate()} before writing to them for the first time.
+ * MUST call {@link #isolate()} before writing to them for the first time. All backing-array writes are guarded this way.
  */
 public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurableMemory
 {
