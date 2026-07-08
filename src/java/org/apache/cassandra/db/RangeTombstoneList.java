@@ -71,7 +71,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     private long boundaryHeapSize;
     private int size;
-    private volatile boolean shared;
+    private boolean shared;
 
     private void isolate()
     {
