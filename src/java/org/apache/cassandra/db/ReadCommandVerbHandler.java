@@ -56,10 +56,18 @@ public class ReadCommandVerbHandler implements IVerbHandler<ReadCommand>
     public ReadResponse doRead(ReadCommand command, boolean trackRepairedData)
     {
         ReadResponse response;
-        try (ReadExecutionController controller = command.executionController(trackRepairedData);
-             UnfilteredPartitionIterator iterator = command.executeLocally(controller))
+        try
         {
-            response = command.createResponse(iterator, controller.getRepairedDataInfo());
+            ReadResponse.isRemoteRead.set(true);
+            try (ReadExecutionController controller = command.executionController(trackRepairedData);
+                 UnfilteredPartitionIterator iterator = command.executeLocally(controller))
+            {
+                response = command.createResponse(iterator, controller.getRepairedDataInfo());
+            }
+        }
+        finally
+        {
+            ReadResponse.isRemoteRead.remove();
         }
 
         return response;

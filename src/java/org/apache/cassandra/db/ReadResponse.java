@@ -46,6 +46,8 @@ import static org.apache.cassandra.db.RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO;
 
 public abstract class ReadResponse
 {
+    public static final ThreadLocal<Boolean> isRemoteRead = ThreadLocal.withInitial(() -> false);
+
     // Serializer for single partition read response
     public static final IVersionedSerializer<ReadResponse> serializer = new Serializer();
 
@@ -237,7 +239,7 @@ public abstract class ReadResponse
         private final java.util.List<MaterializedPartition> materialized;
         private final ByteBuffer repairedDataDigest;
         private final boolean isRepairedDigestConclusive;
-        private ByteBuffer serializedData;
+        private volatile ByteBuffer serializedData;
 
         private static class MaterializedPartition
         {
@@ -260,7 +262,6 @@ public abstract class ReadResponse
                 this.unfiltereds = new java.util.ArrayList<>();
                 while (iterator.hasNext())
                     this.unfiltereds.add(iterator.next());
-                iterator.close();
             }
 
             private UnfilteredRowIterator toIterator(TableMetadata metadata)
@@ -291,11 +292,10 @@ public abstract class ReadResponse
             {
                 result.add(new MaterializedPartition(iterator.next()));
             }
-            iterator.close();
             return result;
         }
 
-        private static UnfilteredPartitionIterator toPartitionIterator(java.util.List<MaterializedPartition> materialized, TableMetadata metadata)
+        private static UnfilteredPartitionIterator toPartitionIterator(java.util.List<MaterializedPartition> materialized, TableMetadata metadata, ColumnFilter selection)
         {
             return new UnfilteredPartitionIterator()
             {
@@ -313,7 +313,7 @@ public abstract class ReadResponse
 
                 public UnfilteredRowIterator next()
                 {
-                    return iter.next().toIterator(metadata);
+                    return org.apache.cassandra.db.rows.UnfilteredRowIterators.withOnlyQueriedData(iter.next().toIterator(metadata), selection);
                 }
 
                 public void close()
@@ -327,9 +327,21 @@ public abstract class ReadResponse
             super(null, null, false, MessagingService.current_version, DeserializationHelper.Flag.LOCAL);
             this.metadata = iter.metadata();
             this.selection = command.columnFilter();
-            this.materialized = materialize(iter);
-            this.repairedDataDigest = rdi.getDigest();
-            this.isRepairedDigestConclusive = rdi.isConclusive();
+            
+            if (isRemoteRead.get())
+            {
+                this.materialized = null;
+                this.serializedData = build(iter, selection);
+                this.repairedDataDigest = rdi.getDigest();
+                this.isRepairedDigestConclusive = rdi.isConclusive();
+            }
+            else
+            {
+                this.serializedData = null;
+                this.materialized = materialize(iter);
+                this.repairedDataDigest = rdi.getDigest();
+                this.isRepairedDigestConclusive = rdi.isConclusive();
+            }
         }
 
         private LocalDataResponse(UnfilteredPartitionIterator iter, ColumnFilter selection)
@@ -337,15 +349,30 @@ public abstract class ReadResponse
             super(null, null, false, MessagingService.current_version, DeserializationHelper.Flag.LOCAL);
             this.metadata = iter.metadata();
             this.selection = selection;
-            this.materialized = materialize(iter);
-            this.repairedDataDigest = null;
-            this.isRepairedDigestConclusive = false;
+            
+            if (isRemoteRead.get())
+            {
+                this.materialized = null;
+                this.serializedData = build(iter, selection);
+                this.repairedDataDigest = null;
+                this.isRepairedDigestConclusive = false;
+            }
+            else
+            {
+                this.serializedData = null;
+                this.materialized = materialize(iter);
+                this.repairedDataDigest = null;
+                this.isRepairedDigestConclusive = false;
+            }
         }
 
         @Override
         public UnfilteredPartitionIterator makeIterator(ReadCommand command)
         {
-            return toPartitionIterator(materialized, command.metadata());
+            if (materialized != null)
+                return toPartitionIterator(materialized, command.metadata(), command.columnFilter());
+            else
+                return super.makeIterator(command);
         }
 
         @Override
@@ -363,11 +390,19 @@ public abstract class ReadResponse
         @Override
         protected ByteBuffer data()
         {
-            if (serializedData == null)
+            ByteBuffer local = serializedData;
+            if (local == null)
             {
-                serializedData = build(toPartitionIterator(materialized, metadata), selection);
+                synchronized (this)
+                {
+                    local = serializedData;
+                    if (local == null)
+                    {
+                        serializedData = local = build(toPartitionIterator(materialized, metadata, ColumnFilter.all(metadata)), selection);
+                    }
+                }
             }
-            return serializedData;
+            return local;
         }
 
         private static ByteBuffer build(UnfilteredPartitionIterator iter, ColumnFilter selection)
