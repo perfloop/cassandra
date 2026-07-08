@@ -20,11 +20,13 @@ import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.CellPath;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.ValueAccessor;
 import org.apache.cassandra.utils.memory.Cloner;
 
 public class MergeIteratorBench
 {
-    static class MockColumnData extends ColumnData
+    static class MockColumnData extends Cell<ByteBuffer>
     {
         public MockColumnData(ColumnMetadata column)
         {
@@ -37,7 +39,6 @@ public class MergeIteratorBench
         @Override public void validate() {}
         @Override public boolean hasInvalidDeletions() { return false; }
         @Override public void digest(Digest digest) {}
-        @Override public ColumnData clone(Cloner cloner) { return this; }
         @Override public int estimateCloneSize(Cloner cloner) { return 0; }
         @Override public ColumnData updateAllTimestamp(long timestamp) { return this; }
         @Override public ColumnData updateTimesAndPathsForAccord(Function<Cell, CellPath> cellToMaybeNewListPath, long newTimestamp, long newLocalDeletionTime) { return this; }
@@ -46,6 +47,22 @@ public class MergeIteratorBench
         @Override public ColumnData purge(DeletionPurger purger, long nowInSec) { return this; }
         @Override public ColumnData purgeDataOlderThan(long timestamp) { return this; }
         @Override public long maxTimestamp() { return 0; }
+
+        @Override public boolean isCounterCell() { return false; }
+        @Override public ByteBuffer value() { return ByteBufferUtil.EMPTY_BYTE_BUFFER; }
+        @Override public ValueAccessor<ByteBuffer> accessor() { return ByteBufferAccessor.instance; }
+        @Override public long timestamp() { return 0L; }
+        @Override public int ttl() { return NO_TTL; }
+        @Override public boolean isTombstone() { return false; }
+        @Override public boolean isExpiring() { return false; }
+        @Override public boolean isLive(long nowInSec) { return true; }
+        @Override public CellPath path() { return null; }
+        @Override public Cell<?> withUpdatedColumn(ColumnMetadata newColumn) { return this; }
+        @Override public Cell<?> withUpdatedValue(ByteBuffer newValue) { return this; }
+        @Override public Cell<?> withUpdatedTimestamp(long newTimestamp) { return this; }
+        @Override public Cell<?> withUpdatedTimestampAndLocalDeletionTime(long newTimestamp, long newLocalDeletionTime) { return this; }
+        @Override public Cell<?> withSkippedValue() { return this; }
+        @Override protected int localDeletionTimeAsUnsignedInt() { return NO_DELETION_TIME_UNSIGNED_INTEGER; }
     }
 
     public static Row mockRow(Clustering<?> clustering, List<ColumnData> columnData)
