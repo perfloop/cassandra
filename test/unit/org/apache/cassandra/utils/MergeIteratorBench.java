@@ -23,18 +23,9 @@ public class MergeIteratorBench
 {
     static class MockColumnData extends ColumnData
     {
-        private final ColumnMetadata column;
-
         public MockColumnData(ColumnMetadata column)
         {
-            super();
-            this.column = column;
-        }
-
-        @Override
-        public ColumnMetadata column()
-        {
-            return column;
+            super(column);
         }
 
         @Override public int dataSize() { return 0; }
@@ -44,13 +35,13 @@ public class MergeIteratorBench
         @Override public boolean hasInvalidDeletions() { return false; }
         @Override public void digest(Digest digest) {}
         @Override public ColumnData clone(Cloner cloner) { return this; }
-        @Override public long estimateCloneSize(Cloner cloner) { return 0; }
-        @Override public void updateAllTimestamp(long timestamp) {}
-        @Override public void updateTimesAndPathsForAccord(long timestamp, long rts, long wts) {}
-        @Override public void updateAllTimesWithNewCellPathForComplexColumnData(CellPath path) {}
-        @Override public void markCounterLocalToBeCleared() {}
-        @Override public void purge(DeletionTime activeDeletion, long nowInSec, boolean keepDeletedColumns) {}
-        @Override public void purgeDataOlderThan(long timestamp) {}
+        @Override public int estimateCloneSize(Cloner cloner) { return 0; }
+        @Override public ColumnData updateAllTimestamp(long timestamp) { return this; }
+        @Override public ColumnData updateTimesAndPathsForAccord(long timestamp, long rts, long wts) { return this; }
+        @Override public ColumnData updateAllTimesWithNewCellPathForComplexColumnData(CellPath path) { return this; }
+        @Override public ColumnData markCounterLocalToBeCleared() { return this; }
+        @Override public ColumnData purge(DeletionTime activeDeletion, long nowInSec, boolean keepDeletedColumns) { return this; }
+        @Override public ColumnData purgeDataOlderThan(long timestamp) { return this; }
         @Override public long maxTimestamp() { return 0; }
     }
 
