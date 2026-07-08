@@ -5,7 +5,7 @@ import java.lang.reflect.Proxy;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
-import java.util.function.Function;
+import com.google.common.base.Function;
 import com.sun.management.ThreadMXBean;
 import java.lang.management.ManagementFactory;
 
