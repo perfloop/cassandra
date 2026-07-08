@@ -131,7 +131,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
      * as shared ({@code shared = true}). To maintain independent states, any subsequent in-place mutation on
      * either instance must first trigger {@link #isolate()} to copy and isolate the backing arrays before writing.
      *
-     * @return a copy-on-write copy of this list.
+     * @return a thread-confined copy-on-write copy of this list.
      */
     public RangeTombstoneList copy()
     {
