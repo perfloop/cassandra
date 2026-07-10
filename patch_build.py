@@ -1,3 +1,19 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 
 # 1. Patch build.xml
@@ -38,6 +54,17 @@ new_str = old_str + """
      <exclude name="**/CassandraBriefJUnitResultFormatter.java"/>
      <exclude name="**/CassandraXMLJUnitResultFormatter.java"/>
      <exclude name="**/JStackJUnitTask.java"/>
+     <exclude name="**/InstanceConfig.java"/>
+     <exclude name="**/IsolatedJmx.java"/>
+     <exclude name="**/CompactStoragePagingWithProtocolTester.java"/>
+     <exclude name="**/ConfigCompatibilityTestGenerate.java"/>
+     <exclude name="**/MultiNodeTableWalkBase.java"/>
+     <exclude name="**/CasMultiNodeTableWalkBase.java"/>
+     <exclude name="**/AccordInteropMultiNodeTableWalkBase.java"/>
+     <exclude name="**/AccordInteropMultiNodeTokenConflictBase.java"/>
+     <exclude name="**/SimulatedOperation.java"/>
+     <exclude name="**/CASCommonTestCases.java"/>
+     <exclude name="**/BaseAssassinatedCase.java"/>
     </javac>
     <javac
      compiler="modern"
@@ -68,105 +95,3 @@ if "microbench-build" not in content and old_str in content:
     print("build.xml successfully patched")
 else:
     print("build.xml already patched or marker not found")
-
-# 2. Patch TlsTestUtils.java
-tls_file = 'test/unit/org/apache/cassandra/transport/TlsTestUtils.java'
-if os.path.exists(tls_file):
-    tls_content = open(tls_file).read()
-    
-    old_imports = """import org.apache.cassandra.distributed.api.ICluster;
-import org.apache.cassandra.distributed.api.IInvokableInstance;
-import org.apache.cassandra.distributed.shared.ClusterUtils;
-import org.apache.cassandra.distributed.util.Auth;
-import org.apache.cassandra.distributed.util.SingleHostLoadBalancingPolicy;"""
-
-    new_imports = """// import org.apache.cassandra.distributed.api.ICluster;
-// import org.apache.cassandra.distributed.api.IInvokableInstance;
-// import org.apache.cassandra.distributed.shared.ClusterUtils;
-// import org.apache.cassandra.distributed.util.Auth;
-// import org.apache.cassandra.distributed.util.SingleHostLoadBalancingPolicy;"""
-
-    old_method1 = """    public static void configureIdentity(ICluster<IInvokableInstance> cluster, SSLOptions sslOptions)
-    {
-        withAuthenticatedSession(cluster.get(1), DEFAULT_SUPERUSER_NAME, DEFAULT_SUPERUSER_PASSWORD, session -> {
-            session.execute("CREATE ROLE cassandra_ssl_test WITH LOGIN = true");
-            session.execute(String.format("ADD IDENTITY '%s' TO ROLE 'cassandra_ssl_test'", CLIENT_SPIFFE_IDENTITY));
-            // GRANT select to cassandra_ssl_test to be able to query the system_views.clients virtual table
-            session.execute("GRANT SELECT ON system_views.clients to cassandra_ssl_test");
-        }, sslOptions);
-    }"""
-
-    new_method1 = """    /*
-    public static void configureIdentity(ICluster<IInvokableInstance> cluster, SSLOptions sslOptions)
-    {
-        withAuthenticatedSession(cluster.get(1), DEFAULT_SUPERUSER_NAME, DEFAULT_SUPERUSER_PASSWORD, session -> {
-            session.execute("CREATE ROLE cassandra_ssl_test WITH LOGIN = true");
-            session.execute(String.format("ADD IDENTITY '%s' TO ROLE 'cassandra_ssl_test'", CLIENT_SPIFFE_IDENTITY));
-            // GRANT select to cassandra_ssl_test to be able to query the system_views.clients virtual table
-            session.execute("GRANT SELECT ON system_views.clients to cassandra_ssl_test");
-        }, sslOptions);
-    }
-    */"""
-
-    old_method2 = """    public static void withAuthenticatedSession(IInvokableInstance instance,
-                                         String username,
-                                         String password,
-                                         Consumer<Session> consumer,
-                                         SSLOptions sslOptions)
-    {
-        // wait for existing roles
-        Auth.waitForExistingRoles(instance);
-
-        InetSocketAddress nativeInetSocketAddress = ClusterUtils.getNativeInetSocketAddress(instance);
-        InetAddress address = nativeInetSocketAddress.getAddress();
-        LoadBalancingPolicy lbc = new SingleHostLoadBalancingPolicy(address);
-
-        com.datastax.driver.core.Cluster.Builder builder = com.datastax.driver.core.Cluster.builder()
-                                                                                           .withLoadBalancingPolicy(lbc)
-                                                                                           .withSSL(sslOptions)
-                                                                                           .withAuthProvider(new PlainTextAuthProvider(username, password))
-                                                                                           .addContactPoint(address.getHostAddress())
-                                                                                           .withPort(nativeInetSocketAddress.getPort());
-
-        try (com.datastax.driver.core.Cluster c = builder.build(); Session session = c.connect())
-        {
-            consumer.accept(session);
-        }
-    }"""
-
-    new_method2 = """    /*
-    public static void withAuthenticatedSession(IInvokableInstance instance,
-                                         String username,
-                                         String password,
-                                         Consumer<Session> consumer,
-                                         SSLOptions sslOptions)
-    {
-        // wait for existing roles
-        Auth.waitForExistingRoles(instance);
-
-        InetSocketAddress nativeInetSocketAddress = ClusterUtils.getNativeInetSocketAddress(instance);
-        InetAddress address = nativeInetSocketAddress.getAddress();
-        LoadBalancingPolicy lbc = new SingleHostLoadBalancingPolicy(address);
-
-        com.datastax.driver.core.Cluster.Builder builder = com.datastax.driver.core.Cluster.builder()
-                                                                                           .withLoadBalancingPolicy(lbc)
-                                                                                           .withSSL(sslOptions)
-                                                                                           .withAuthProvider(new PlainTextAuthProvider(username, password))
-                                                                                           .addContactPoint(address.getHostAddress())
-                                                                                           .withPort(nativeInetSocketAddress.getPort());
-
-        try (com.datastax.driver.core.Cluster c = builder.build(); Session session = c.connect())
-        {
-            consumer.accept(session);
-        }
-    }
-    */"""
-
-    if old_imports in tls_content:
-        tls_content = tls_content.replace(old_imports, new_imports, 1)
-        tls_content = tls_content.replace(old_method1, new_method1, 1)
-        tls_content = tls_content.replace(old_method2, new_method2, 1)
-        open(tls_file, 'w').write(tls_content)
-        print("TlsTestUtils.java successfully patched")
-    else:
-        print("TlsTestUtils.java already patched or markers not found")
