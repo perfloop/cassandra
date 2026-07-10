@@ -389,13 +389,12 @@ public class SSTableCursorReader implements AutoCloseable
         {
             try
             {
-                dataReader.readFully(transferBuffer, 0, length);
+                dataReader.copyTo(writer, length);
             }
             catch (Exception e)
             {
                 corruptSSTable(e);
             }
-            writer.write(transferBuffer, 0, length);
         }
         else
         {
@@ -410,20 +409,13 @@ public class SSTableCursorReader implements AutoCloseable
             if (length < 0)
                 corruptSSTable("Corrupt (negative) value length encountered");
             writer.writeUnsignedVInt32(length);
-            int remaining = length;
-            while (remaining > 0)
+            try
             {
-                int readLength = Math.min(remaining, transferBuffer.length);
-                try
-                {
-                    dataReader.readFully(transferBuffer, 0, readLength);
-                }
-                catch (Exception e)
-                {
-                    corruptSSTable(e);
-                }
-                writer.write(transferBuffer, 0, readLength);
-                remaining -= readLength;
+                dataReader.copyTo(writer, length);
+            }
+            catch (Exception e)
+            {
+                corruptSSTable(e);
             }
         }
     }

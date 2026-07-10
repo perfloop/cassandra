@@ -135,6 +135,31 @@ public abstract class RebufferingInputStream extends DataInputStreamPlus impleme
         }
     }
 
+    public void copyTo(DataOutputPlus writer, int length) throws IOException
+    {
+        int copied = 0;
+        while (copied < length)
+        {
+            int position = buffer.position();
+            int remaining = buffer.limit() - position;
+            if (remaining == 0)
+            {
+                reBuffer();
+                position = buffer.position();
+                remaining = buffer.limit() - position;
+                if (remaining == 0)
+                    throw new EOFException("EOF after " + copied + " bytes out of " + length);
+            }
+            int toCopy = min(length - copied, remaining);
+            ByteBuffer dupe = buffer.duplicate();
+            dupe.position(position);
+            dupe.limit(position + toCopy);
+            writer.write(dupe);
+            buffer.position(position + toCopy);
+            copied += toCopy;
+        }
+    }
+
     @DontInline
     protected long readPrimitiveSlowly(int bytes) throws IOException
     {
