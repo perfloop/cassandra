@@ -55,7 +55,7 @@ public class RangeTombstoneListBench
     private RangeTombstoneList existing;
     private RangeTombstone tombstone;
 
-    @Param({"10", "100", "1000"})
+    @Param({"100", "1000"})
     private int size;
 
     @Setup(Level.Trial)
