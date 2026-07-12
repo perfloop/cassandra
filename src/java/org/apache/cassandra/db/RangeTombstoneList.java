@@ -58,6 +58,8 @@ import org.apache.cassandra.utils.memory.ByteBufferCloner;
  */
 public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurableMemory
 {
+    public static final java.util.concurrent.atomic.AtomicInteger copyCount = new java.util.concurrent.atomic.AtomicInteger(0);
+
     private static long EMPTY_SIZE = ObjectSizes.measure(new RangeTombstoneList(null, 0));
 
     private final ClusteringComparator comparator;
@@ -135,16 +137,30 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
      */
     public RangeTombstoneList copy()
     {
-        this.shared = true;
-        RangeTombstoneList copy = new RangeTombstoneList(comparator,
-                                                         starts,
-                                                         ends,
-                                                         markedAts,
-                                                         delTimesUnsignedIntegers,
-                                                         boundaryHeapSize,
-                                                         size);
-        copy.shared = true;
-        return copy;
+        copyCount.incrementAndGet();
+        // If there is significant spare capacity, trim to size to avoid retaining too much unused memory.
+        // Otherwise, share the backing arrays via Copy-on-Write (COW).
+        if (starts.length > size + 5 && starts.length > size * 1.5)
+        {
+            ClusteringBound<?>[] startsCopy = Arrays.copyOf(starts, size);
+            ClusteringBound<?>[] endsCopy = Arrays.copyOf(ends, size);
+            long[] markedAtsCopy = Arrays.copyOf(markedAts, size);
+            int[] delTimesCopy = Arrays.copyOf(delTimesUnsignedIntegers, size);
+            return new RangeTombstoneList(comparator, startsCopy, endsCopy, markedAtsCopy, delTimesCopy, boundaryHeapSize, size);
+        }
+        else
+        {
+            this.shared = true;
+            RangeTombstoneList copy = new RangeTombstoneList(comparator,
+                                                             starts,
+                                                             ends,
+                                                             markedAts,
+                                                             delTimesUnsignedIntegers,
+                                                             boundaryHeapSize,
+                                                             size);
+            copy.shared = true;
+            return copy;
+        }
     }
 
     public RangeTombstoneList clone(ByteBufferCloner cloner)
@@ -222,14 +238,28 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
         if (isEmpty())
         {
-            tombstones.shared = true;
-            this.starts = tombstones.starts;
-            this.ends = tombstones.ends;
-            this.markedAts = tombstones.markedAts;
-            this.delTimesUnsignedIntegers = tombstones.delTimesUnsignedIntegers;
-            this.size = tombstones.size;
-            this.boundaryHeapSize = tombstones.boundaryHeapSize;
-            this.shared = true;
+            // If the source list has significant spare capacity, trim it when adopting to avoid memory footprint inflation.
+            if (tombstones.starts.length > tombstones.size + 5 && tombstones.starts.length > tombstones.size * 1.5)
+            {
+                this.starts = Arrays.copyOf(tombstones.starts, tombstones.size);
+                this.ends = Arrays.copyOf(tombstones.ends, tombstones.size);
+                this.markedAts = Arrays.copyOf(tombstones.markedAts, tombstones.size);
+                this.delTimesUnsignedIntegers = Arrays.copyOf(tombstones.delTimesUnsignedIntegers, tombstones.size);
+                this.size = tombstones.size;
+                this.boundaryHeapSize = tombstones.boundaryHeapSize;
+                this.shared = false;
+            }
+            else
+            {
+                tombstones.shared = true;
+                this.starts = tombstones.starts;
+                this.ends = tombstones.ends;
+                this.markedAts = tombstones.markedAts;
+                this.delTimesUnsignedIntegers = tombstones.delTimesUnsignedIntegers;
+                this.size = tombstones.size;
+                this.boundaryHeapSize = tombstones.boundaryHeapSize;
+                this.shared = true;
+            }
             return;
         }
 
@@ -709,6 +739,8 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         assert i >= 0;
 
         if (size == capacity())
+            // growToFree already allocates fresh backing arrays and sets shared = false,
+            // so a separate isolate() call is unnecessary on this branch.
             growToFree(i);
         else
         {
@@ -805,6 +837,17 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         boundaryHeapSize += start.unsharedHeapSize() + end.unsharedHeapSize();
     }
 
+    /**
+     * Returns the unshared heap size of this list.
+     * <p>
+     * <b>Heap Accounting under Copy-on-Write:</b>
+     * When two instances share backing arrays due to copy-on-write, both instances charge the arrays to their
+     * {@link #unsharedHeapSize()}. When a new list merges and replaces an existing list in the memtable, the old list
+     * is discarded and garbage collected, meaning only one instance remains active. By charging the arrays to both,
+     * the allocator delta {@code newInfo.unsharedHeapSize() - existing.unsharedHeapSize()} correctly evaluates to 0
+     * (or the array growth delta), ensuring honest and accurate memtable memory accounting without requiring
+     * complex ref-counting or garbage collection tracking machinery.
+     */
     @Override
     public long unsharedHeapSize()
     {

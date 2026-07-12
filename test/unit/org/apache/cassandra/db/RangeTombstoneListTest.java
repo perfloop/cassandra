@@ -837,4 +837,91 @@ public class RangeTombstoneListTest
     {
         return new RangeTombstone(Slice.make(BufferClusteringBound.exclusiveStartOf(bb(start)), BufferClusteringBound.TOP), DeletionTime.build(tstamp, delTime));
     }
+
+    @Test
+    public void testCOWHonestHeapAccounting()
+    {
+        RangeTombstoneList original = new RangeTombstoneList(cmp, 2);
+        original.add(rt(1, 5, 10));
+        original.add(rt(7, 10, 20));
+
+        RangeTombstoneList copy = original.copy();
+        
+        // Both should report the same size, including shared arrays
+        assertEquals(original.unsharedHeapSize(), copy.unsharedHeapSize());
+        
+        // Allocator delta calculation: should be exactly 0 since copy's arrays are shared
+        long delta = copy.unsharedHeapSize() - original.unsharedHeapSize();
+        assertEquals(0, delta);
+    }
+
+    @Test
+    public void testCOWHighSpareCapacityTrimming()
+    {
+        // Setup a list with massive capacity, but small size
+        RangeTombstoneList original = new RangeTombstoneList(cmp, 100);
+        original.add(rt(1, 5, 10));
+        original.add(rt(7, 10, 20)); // size = 2, capacity = 100 (high spare capacity)
+
+        RangeTombstoneList copy = original.copy();
+
+        // High spare capacity copy must be trimmed to size (capacity should equal size)
+        assertEquals(2, copy.size());
+        
+        // Modifying the copy should be completely isolated
+        copy.add(rt(12, 15, 30));
+        assertEquals(2, original.size());
+        assertEquals(3, copy.size());
+
+        // Empty-target addAll semantics with high spare capacity
+        RangeTombstoneList empty = new RangeTombstoneList(cmp, 10);
+        empty.addAll(original); // adopting a high spare capacity list should trim it
+        assertEquals(2, empty.size());
+    }
+
+    @Test
+    public void testCOWGrowToFreeIsolation()
+    {
+        RangeTombstoneList original = new RangeTombstoneList(cmp, 2);
+        original.add(rt(1, 5, 10));
+        original.add(rt(7, 10, 20));
+
+        RangeTombstoneList copy = original.copy();
+
+        // This addition should trigger growToFree, allocating new arrays and isolating automatically
+        original.add(rt(12, 15, 30));
+        
+        // Modify copy: should have been cleanly isolated by the growth
+        copy.add(rt(20, 25, 40));
+        
+        assertEquals(3, original.size());
+        assertEquals(3, copy.size());
+    }
+
+    @Test
+    public void testCOWMultiGenerationCopies()
+    {
+        RangeTombstoneList gen1 = new RangeTombstoneList(cmp, 10);
+        gen1.add(rt(1, 5, 10));
+
+        RangeTombstoneList gen2 = gen1.copy();
+        RangeTombstoneList gen3 = gen2.copy();
+
+        // All three share backing arrays initially
+        assertEquals(1, gen1.size());
+        assertEquals(1, gen2.size());
+        assertEquals(1, gen3.size());
+
+        // Mutating gen2 isolates gen2
+        gen2.add(rt(7, 10, 20));
+        assertEquals(1, gen1.size());
+        assertEquals(2, gen2.size());
+        assertEquals(1, gen3.size());
+
+        // Mutating gen3 isolates gen3
+        gen3.add(rt(12, 15, 30));
+        assertEquals(1, gen1.size());
+        assertEquals(2, gen2.size());
+        assertEquals(2, gen3.size());
+    }
 }

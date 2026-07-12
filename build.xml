@@ -1587,6 +1587,18 @@
     </testmacro>
   </target>
 
+  <target name="harry-testsome" depends="maybe-build-test" description="Execute specific harry tests" >
+    <testmacro inputdir="${test.harry.src}" timeout="${test.timeout}">
+      <test if="withMethods" name="${test.name}" methods="${test.methods}" todir="${build.test.output.dir}/" outfile="TEST-${test.name}-${test.methods}"/>
+      <test if="withoutMethods" name="${test.name}" todir="${build.test.output.dir}/" outfile="TEST-${test.name}"/>
+      <jvmarg value="-Dlegacy-sstable-root=${test.data}/legacy-sstables"/>
+      <jvmarg value="-Dinvalid-legacy-sstable-root=${test.data}/invalid-legacy-sstables"/>
+      <jvmarg value="-Dcassandra.ring_delay_ms=1000"/>
+      <jvmarg value="-Dcassandra.tolerate_sstable_size=true"/>
+      <jvmarg value="-Dcassandra.skip_sync=true" />
+    </testmacro>
+  </target>
+
   <!-- Use this with an FQDN for test class, and an optional csv list of methods like this:
     ant long-testsome -Dtest.name=org.apache.cassandra.cql3.ManyRowsTest
     ant long-testsome -Dtest.name=org.apache.cassandra.cql3.ManyRowsTest -Dtest.methods=testLargeCount

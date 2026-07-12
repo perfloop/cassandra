@@ -111,6 +111,171 @@ public class HarryCompactionWithRangeDeletionsTest extends CQLTester
     };
 
     @Test
+    public void testMemtableRangeDeletesThenCompact() throws IOException
+    {
+        testMemtableRangeDeletesThenCompactOnce();
+    }
+
+    public void testMemtableRangeDeletesThenCompactOnce() throws IOException
+    {
+        perTestSetup();
+        withRandom(205413964293041L, rng -> {
+
+            SchemaSpec schema = schemaSpecGenerator.generate(rng);
+            schemaChange(String.format("CREATE KEYSPACE IF NOT EXISTS %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}", schema.keyspace));
+            createTable(schema.compile());
+
+            HistoryBuilder history = new HistoryBuilder(schema.valueGenerators);
+            history.customThrowing(() -> {
+                ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(table);
+                cfs.disableAutoCompaction();
+            }, "disable compaction");
+
+            AtomicReference<HarrySSTableWriter> sstableWriter = new AtomicReference<>();
+            ThrowingRunnable flushAndChangeWriter = () -> {
+                HarrySSTableWriter prev = sstableWriter.get();
+                if (prev != null)
+                {
+                    prev.close();
+                    StorageService.instance.bulkLoad(dataDir.absolutePath());
+                    dataDir.forEach(file -> file.delete());
+                }
+
+                Invariants.require(sstableWriter.getAndSet(HarrySSTableWriter.builder()
+                                                                                   .forTable(schema.compile())
+                                                                                   .inDirectory(dataDir)
+                                                                                   .build()) == prev);
+            };
+            flushAndChangeWriter.run();
+
+            int fixedPartitionPd = 2 * PARTITIONS_RANGE + 10;
+            HistoryBuilder.IndexedValueGenerators valueGens = (HistoryBuilder.IndexedValueGenerators) schema.valueGenerators;
+            long fixedPartitionPdDesc = valueGens.pkGen().descriptorAt(fixedPartitionPd);
+
+            // Let's find 20 row indices, and sort them by their clustering key's first component (ck1)
+            Integer[] sortedRowIndices = new Integer[100];
+            for (int i = 0; i < 100; i++)
+                sortedRowIndices[i] = i;
+
+            Arrays.sort(sortedRowIndices, (a, b) -> {
+                long cdA = valueGens.ckGen().descriptorAt(a);
+                long cdB = valueGens.ckGen().descriptorAt(b);
+                String strA = (String) valueGens.ckGen().inflate(cdA)[0];
+                String strB = (String) valueGens.ckGen().inflate(cdB)[0];
+                return strA.compareTo(strB);
+            });
+
+            history.insert(fixedPartitionPd, 0);
+            int N = 10;
+            for (int i = 0; i < N; i++)
+            {
+                int lowerBound = sortedRowIndices[i * 2];
+                int upperBound = sortedRowIndices[i * 2 + 1];
+                history.deleteRowRange(fixedPartitionPd, lowerBound, upperBound, 0, true, true);
+            }
+
+            DataTracker tracker = new DataTracker.SequentialDataTracker();
+            CQLVisitExecutor executor = new CQLTesterVisitExecutor(schema, tracker,
+                                              new QuiescentChecker(schema.valueGenerators, tracker, history),
+                                              statement -> {
+                                                  if (logger.isTraceEnabled())
+                                                      logger.trace(statement.toString());
+                                                  return execute(statement.cql(), statement.bindings());
+                                              })
+            {
+                @Override
+                protected void executeMutatingVisit(Visit visit, CompiledStatement statement)
+                {
+                    try
+                    {
+                        if (visit.visitedPartitions.contains(fixedPartitionPdDesc))
+                        {
+                            HarryCompactionWithRangeDeletionsTest.this.execute(statement.cql(), statement.bindings());
+                        }
+                        else
+                        {
+                            sstableWriter.get().addRow(statement.cql(), statement.bindings());
+                        }
+                    }
+                    catch (IOException e)
+                    {
+                        throw new UncheckedIOException(e);
+                    }
+                }
+            };
+
+            org.apache.cassandra.db.RangeTombstoneList.copyCount.set(0);
+
+            for (Visit visit : history)
+            {
+                executor.execute(visit);
+            }
+
+            int observedCopies = org.apache.cassandra.db.RangeTombstoneList.copyCount.get();
+            System.out.println("OBSERVED COPIES BEFORE FLUSH: " + observedCopies);
+            org.junit.Assert.assertTrue("Expected at least N-1 copy() calls for N sequential range deletions, but got " + observedCopies, observedCopies >= N - 1);
+
+            for (int sstablesFlushed = 0; sstablesFlushed < 3; sstablesFlushed++)
+            {
+                for (int i = 0; i < PARTITIONS_RANGE; i++)
+                {
+                    for (int j = 0; j < ROWS_RANGE; j++)
+                    {
+                        history.insert(rng.nextInt(0, 2 * PARTITIONS_RANGE), rng.nextInt(0, 2 * ROWS_RANGE));
+                    }
+                }
+                int lowerBoundRowIdx = rng.nextInt(ROWS_RANGE);
+                int upperBoundRowIdx = rng.nextInt(lowerBoundRowIdx, 2 * ROWS_RANGE);
+                history.deleteRowRange(rng.nextInt(0, 2 * PARTITIONS_RANGE),
+                                       lowerBoundRowIdx,
+                                       upperBoundRowIdx,
+                                       rng.nextInt(REG_COLS),
+                                       rng.nextBoolean(),
+                                       rng.nextBoolean());
+
+                history.customThrowing(flushAndChangeWriter, "flush sstable" + sstablesFlushed);
+            }
+
+            history.customThrowing(() -> {
+                ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(table);
+                cfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
+            }, "flush memtable");
+
+            history.customThrowing(() -> {
+                ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(table);
+                cfs.forceMajorCompaction();
+            }, "major compaction");
+
+            for (int i = 0; i < 2 * PARTITIONS_RANGE; i++)
+                history.selectPartition(i);
+            history.selectPartition(fixedPartitionPd);
+
+            for (Visit visit : history)
+            {
+                if (visit.lts > 1 + N)
+                {
+                    try
+                    {
+                        executor.execute(visit);
+                    }
+                    catch (Throwable t)
+                    {
+                        System.out.println("FAILED EXECUTING VISIT: lts=" + visit.lts + ", visitedPartitions=" + visit.visitedPartitions + ", operations=" + Arrays.toString(visit.operations));
+                        throw t;
+                    }
+                }
+            }
+
+            if (sstableWriter.get() != null)
+            {
+                try {
+                    sstableWriter.get().close();
+                } catch (Exception e) {}
+            }
+        });
+    }
+
+    @Test
     public void testFlushAndCompact1() throws IOException {
         testFlushAndCompact(1);
     }
