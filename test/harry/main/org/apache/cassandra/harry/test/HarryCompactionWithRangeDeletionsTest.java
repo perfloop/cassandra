@@ -204,9 +204,19 @@ public class HarryCompactionWithRangeDeletionsTest extends CQLTester
                 }
             };
 
+            AtomicInteger copyCount = new AtomicInteger(0);
+            org.apache.cassandra.db.RangeTombstoneList.onCopy = () -> copyCount.incrementAndGet();
+            int visitIdx = 0;
             for (Visit visit : history)
             {
                 executor.execute(visit);
+                visitIdx++;
+                if (visitIdx == 1 + N)
+                {
+                    int copies = copyCount.get();
+                    org.junit.Assert.assertEquals("Expected exactly N-1 RangeTombstoneList.copy() calls for N unflushed range deletes", N - 1, copies);
+                    org.apache.cassandra.db.RangeTombstoneList.onCopy = null; // Remove hook for the rest of the test
+                }
             }
 
             for (int sstablesFlushed = 0; sstablesFlushed < 3; sstablesFlushed++)

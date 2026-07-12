@@ -55,6 +55,9 @@ import org.apache.cassandra.utils.memory.ByteBufferCloner;
  */
 public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurableMemory
 {
+    @com.google.common.annotations.VisibleForTesting
+    public static volatile Runnable onCopy = null;
+
     private static long EMPTY_SIZE = ObjectSizes.measure(new RangeTombstoneList(null, 0));
 
     private final ClusteringComparator comparator;
@@ -126,6 +129,8 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
     public RangeTombstoneList copy()
     {
         this.shared = true;
+        if (onCopy != null)
+            onCopy.run();
         RangeTombstoneList copy = new RangeTombstoneList(comparator,
                                                          starts,
                                                          ends,
