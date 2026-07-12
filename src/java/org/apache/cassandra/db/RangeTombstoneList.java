@@ -46,15 +46,12 @@ import org.apache.cassandra.utils.memory.ByteBufferCloner;
  * the first one on [5, 10]. If such tombstones are added to a RangeTombstoneList,
  * the range tombstone list will store them as [[0, 5]@t1, [5, 15]@t2].
  * <p>
+ * <p>
  * The only use of the local deletion time is to know when a given tombstone can
  * be purged, which will be done by the purge() method.
  * <p>
- * <b>Copy-on-Write (COW) Invariant:</b>
- * This class implements a copy-on-write optimization. The {@link #copy()} method creates a new instance 
- * that shares the four parallel backing arrays ({@code starts}, {@code ends}, {@code markedAts}, 
- * and {@code delTimesUnsignedIntegers}) with the original instance and marks both instances as shared ({@code shared = true}).
- * To ensure safe copy independence, any operation that performs in-place mutation of these backing arrays 
- * MUST call {@link #isolate()} before writing to them for the first time. All backing-array writes are guarded this way.
+ * <b>Copy-on-Write (COW):</b> {@link #copy()} creates a shallow duplicate sharing backing arrays.
+ * Any subsequent in-place mutation must call {@link #isolate()} before writing to them.
  */
 public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurableMemory
 {
@@ -124,14 +121,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
     }
 
     /**
-     * Creates a copy-on-write duplicate of this list.
-     * <p>
-     * This method shares the four backing arrays ({@code starts}, {@code ends}, {@code markedAts}, and
-     * {@code delTimesUnsignedIntegers}) between the original list and the returned copy, marking both instances
-     * as shared ({@code shared = true}). To maintain independent states, any subsequent in-place mutation on
-     * either instance must first trigger {@link #isolate()} to copy and isolate the backing arrays before writing.
-     *
-     * @return a thread-confined copy-on-write duplicate of this list.
+     * Creates a thread-confined copy-on-write duplicate of this list sharing backing arrays.
      */
     public RangeTombstoneList copy()
     {
@@ -808,15 +798,9 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
     }
 
     /**
-     * Returns the unshared heap size of this list.
-     * <p>
-     * <b>Heap Accounting under Copy-on-Write:</b>
-     * When two instances share backing arrays due to copy-on-write, both instances charge the arrays to their
-     * {@link #unsharedHeapSize()}. When a new list merges and replaces an existing list in the memtable, the old list
-     * is discarded and garbage collected, meaning only one instance remains active. By charging the arrays to both,
-     * the allocator delta {@code newInfo.unsharedHeapSize() - existing.unsharedHeapSize()} correctly evaluates to 0
-     * (or the array growth delta), ensuring honest and accurate memtable memory accounting without requiring
-     * complex ref-counting or garbage collection tracking machinery.
+     * Returns the unshared heap size. Under copy-on-write sharing, both instances charge the arrays.
+     * When one replaces the other in the memtable, the old one is discarded, so the delta size
+     * calculation remains accurate.
      */
     @Override
     public long unsharedHeapSize()
