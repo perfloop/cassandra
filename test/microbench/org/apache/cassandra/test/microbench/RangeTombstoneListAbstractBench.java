@@ -30,6 +30,11 @@ import org.apache.cassandra.db.RangeTombstoneList;
 import org.apache.cassandra.db.Slice;
 import org.apache.cassandra.db.marshal.Int32Type;
 
+/**
+ * Shared abstract base class for RangeTombstoneList JMH microbenchmarks.
+ * Concrete subclasses define their own @Param parameters and override getSize(),
+ * avoiding static field-shadowing bugs during JMH setup.
+ */
 public abstract class RangeTombstoneListAbstractBench
 {
     protected ClusteringComparator comparator;
