@@ -856,30 +856,6 @@ public class RangeTombstoneListTest
     }
 
     @Test
-    public void testCOWHighSpareCapacityTrimming()
-    {
-        // Setup a list with massive capacity, but small size
-        RangeTombstoneList original = new RangeTombstoneList(cmp, 100);
-        original.add(rt(1, 5, 10));
-        original.add(rt(7, 10, 20)); // size = 2, capacity = 100 (high spare capacity)
-
-        RangeTombstoneList copy = original.copy();
-
-        // High spare capacity copy must be trimmed to size (capacity should equal size)
-        assertEquals(2, copy.size());
-        
-        // Modifying the copy should be completely isolated
-        copy.add(rt(12, 15, 30));
-        assertEquals(2, original.size());
-        assertEquals(3, copy.size());
-
-        // Empty-target addAll semantics with high spare capacity
-        RangeTombstoneList empty = new RangeTombstoneList(cmp, 10);
-        empty.addAll(original); // adopting a high spare capacity list should trim it
-        assertEquals(2, empty.size());
-    }
-
-    @Test
     public void testCOWGrowToFreeIsolation()
     {
         RangeTombstoneList original = new RangeTombstoneList(cmp, 2);

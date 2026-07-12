@@ -58,8 +58,6 @@ import org.apache.cassandra.utils.memory.ByteBufferCloner;
  */
 public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurableMemory
 {
-    public static final java.util.concurrent.atomic.AtomicInteger copyCount = new java.util.concurrent.atomic.AtomicInteger(0);
-
     private static long EMPTY_SIZE = ObjectSizes.measure(new RangeTombstoneList(null, 0));
 
     private final ClusteringComparator comparator;
@@ -137,30 +135,16 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
      */
     public RangeTombstoneList copy()
     {
-        copyCount.incrementAndGet();
-        // If there is significant spare capacity, trim to size to avoid retaining too much unused memory.
-        // Otherwise, share the backing arrays via Copy-on-Write (COW).
-        if (starts.length > size + 5 && starts.length > size * 1.5)
-        {
-            ClusteringBound<?>[] startsCopy = Arrays.copyOf(starts, size);
-            ClusteringBound<?>[] endsCopy = Arrays.copyOf(ends, size);
-            long[] markedAtsCopy = Arrays.copyOf(markedAts, size);
-            int[] delTimesCopy = Arrays.copyOf(delTimesUnsignedIntegers, size);
-            return new RangeTombstoneList(comparator, startsCopy, endsCopy, markedAtsCopy, delTimesCopy, boundaryHeapSize, size);
-        }
-        else
-        {
-            this.shared = true;
-            RangeTombstoneList copy = new RangeTombstoneList(comparator,
-                                                             starts,
-                                                             ends,
-                                                             markedAts,
-                                                             delTimesUnsignedIntegers,
-                                                             boundaryHeapSize,
-                                                             size);
-            copy.shared = true;
-            return copy;
-        }
+        this.shared = true;
+        RangeTombstoneList copy = new RangeTombstoneList(comparator,
+                                                         starts,
+                                                         ends,
+                                                         markedAts,
+                                                         delTimesUnsignedIntegers,
+                                                         boundaryHeapSize,
+                                                         size);
+        copy.shared = true;
+        return copy;
     }
 
     public RangeTombstoneList clone(ByteBufferCloner cloner)
@@ -238,28 +222,14 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
         if (isEmpty())
         {
-            // If the source list has significant spare capacity, trim it when adopting to avoid memory footprint inflation.
-            if (tombstones.starts.length > tombstones.size + 5 && tombstones.starts.length > tombstones.size * 1.5)
-            {
-                this.starts = Arrays.copyOf(tombstones.starts, tombstones.size);
-                this.ends = Arrays.copyOf(tombstones.ends, tombstones.size);
-                this.markedAts = Arrays.copyOf(tombstones.markedAts, tombstones.size);
-                this.delTimesUnsignedIntegers = Arrays.copyOf(tombstones.delTimesUnsignedIntegers, tombstones.size);
-                this.size = tombstones.size;
-                this.boundaryHeapSize = tombstones.boundaryHeapSize;
-                this.shared = false;
-            }
-            else
-            {
-                tombstones.shared = true;
-                this.starts = tombstones.starts;
-                this.ends = tombstones.ends;
-                this.markedAts = tombstones.markedAts;
-                this.delTimesUnsignedIntegers = tombstones.delTimesUnsignedIntegers;
-                this.size = tombstones.size;
-                this.boundaryHeapSize = tombstones.boundaryHeapSize;
-                this.shared = true;
-            }
+            tombstones.shared = true;
+            this.starts = tombstones.starts;
+            this.ends = tombstones.ends;
+            this.markedAts = tombstones.markedAts;
+            this.delTimesUnsignedIntegers = tombstones.delTimesUnsignedIntegers;
+            this.size = tombstones.size;
+            this.boundaryHeapSize = tombstones.boundaryHeapSize;
+            this.shared = true;
             return;
         }
 
