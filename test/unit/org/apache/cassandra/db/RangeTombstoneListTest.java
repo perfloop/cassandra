@@ -900,4 +900,33 @@ public class RangeTombstoneListTest
         assertEquals(2, gen2.size());
         assertEquals(2, gen3.size());
     }
+
+    @Test
+    public void testCOWHighSpareCapacitySemantics()
+    {
+        // 1. Low spare capacity: arrays should be shared.
+        RangeTombstoneList lowSpare = new RangeTombstoneList(cmp, 5);
+        lowSpare.add(rt(1, 5, 10));
+        lowSpare.add(rt(7, 10, 20));
+
+        RangeTombstoneList lowSpareCopy = lowSpare.copy();
+        // Since spare capacity is low, they should share arrays
+        org.junit.Assert.assertSame(lowSpare.starts, lowSpareCopy.starts);
+
+        // 2. High spare capacity: arrays should be trimmed and not shared.
+        RangeTombstoneList highSpare = new RangeTombstoneList(cmp, 20); // Large capacity
+        highSpare.add(rt(1, 5, 10));
+        highSpare.add(rt(7, 10, 20));
+
+        RangeTombstoneList highSpareCopy = highSpare.copy();
+        // Since spare capacity is high, they should not share arrays and the copy's arrays should be trimmed to size
+        org.junit.Assert.assertNotSame(highSpare.starts, highSpareCopy.starts);
+        assertEquals(highSpare.size(), highSpareCopy.starts.length);
+
+        // 3. High spare capacity empty-target addAll: should adopt trimmed arrays
+        RangeTombstoneList target = new RangeTombstoneList(cmp, 1);
+        target.addAll(highSpare);
+        // target adopted highSpare, but since highSpare had high spare capacity, target should have trimmed arrays
+        assertEquals(highSpare.size(), target.starts.length);
+    }
 }

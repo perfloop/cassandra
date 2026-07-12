@@ -64,10 +64,10 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     // Note: we don't want to use a List for the markedAts and delTimes to avoid boxing. We could
     // use a List for starts and ends, but having arrays everywhere is almost simpler.
-    private ClusteringBound<?>[] starts;
-    private ClusteringBound<?>[] ends;
-    private long[] markedAts;
-    private int[] delTimesUnsignedIntegers;
+    ClusteringBound<?>[] starts;
+    ClusteringBound<?>[] ends;
+    long[] markedAts;
+    int[] delTimesUnsignedIntegers;
 
     private long boundaryHeapSize;
     private int size;
@@ -131,6 +131,18 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         this.shared = true;
         if (onCopy != null)
             onCopy.run();
+
+        // If there is significant spare capacity, trim to size to avoid retaining too much unused memory
+        // in long-lived or read-only copies.
+        if (starts.length > size + 5 && starts.length > size * 1.5)
+        {
+            ClusteringBound<?>[] startsCopy = Arrays.copyOf(starts, size);
+            ClusteringBound<?>[] endsCopy = Arrays.copyOf(ends, size);
+            long[] markedAtsCopy = Arrays.copyOf(markedAts, size);
+            int[] delTimesCopy = Arrays.copyOf(delTimesUnsignedIntegers, size);
+            return new RangeTombstoneList(comparator, startsCopy, endsCopy, markedAtsCopy, delTimesCopy, boundaryHeapSize, size);
+        }
+
         RangeTombstoneList copy = new RangeTombstoneList(comparator,
                                                          starts,
                                                          ends,
@@ -217,14 +229,28 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
         if (isEmpty())
         {
-            tombstones.shared = true;
-            this.starts = tombstones.starts;
-            this.ends = tombstones.ends;
-            this.markedAts = tombstones.markedAts;
-            this.delTimesUnsignedIntegers = tombstones.delTimesUnsignedIntegers;
-            this.size = tombstones.size;
-            this.boundaryHeapSize = tombstones.boundaryHeapSize;
-            this.shared = true;
+            // If the source list has significant spare capacity, trim it when adopting to avoid memory footprint inflation.
+            if (tombstones.starts.length > tombstones.size + 5 && tombstones.starts.length > tombstones.size * 1.5)
+            {
+                this.starts = Arrays.copyOf(tombstones.starts, tombstones.size);
+                this.ends = Arrays.copyOf(tombstones.ends, tombstones.size);
+                this.markedAts = Arrays.copyOf(tombstones.markedAts, tombstones.size);
+                this.delTimesUnsignedIntegers = Arrays.copyOf(tombstones.delTimesUnsignedIntegers, tombstones.size);
+                this.size = tombstones.size;
+                this.boundaryHeapSize = tombstones.boundaryHeapSize;
+                this.shared = false;
+            }
+            else
+            {
+                tombstones.shared = true;
+                this.starts = tombstones.starts;
+                this.ends = tombstones.ends;
+                this.markedAts = tombstones.markedAts;
+                this.delTimesUnsignedIntegers = tombstones.delTimesUnsignedIntegers;
+                this.size = tombstones.size;
+                this.boundaryHeapSize = tombstones.boundaryHeapSize;
+                this.shared = true;
+            }
             return;
         }
 
