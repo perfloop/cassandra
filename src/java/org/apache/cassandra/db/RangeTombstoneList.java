@@ -64,6 +64,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     private long boundaryHeapSize;
     private int size;
+    private boolean shared;
 
     private RangeTombstoneList(ClusteringComparator comparator,
                                ClusteringBound<?>[] starts,
@@ -111,6 +112,19 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
                                       Arrays.copyOf(markedAts, size),
                                       Arrays.copyOf(delTimesUnsignedIntegers, size),
                                       boundaryHeapSize, size);
+    }
+
+    RangeTombstoneList copyForBTreePartition()
+    {
+        RangeTombstoneList copy = new RangeTombstoneList(comparator,
+                                                          starts,
+                                                          ends,
+                                                          markedAts,
+                                                          delTimesUnsignedIntegers,
+                                                          boundaryHeapSize,
+                                                          size);
+        copy.shared = true;
+        return copy;
     }
 
     public RangeTombstoneList clone(ByteBufferCloner cloner)
@@ -173,6 +187,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         {
             // Note: insertFrom expect i to be the insertion point in term of interval ends
             int pos = Arrays.binarySearch(ends, 0, size, start, comparator);
+            ensureUnshared();
             insertFrom((pos >= 0 ? pos+1 : -pos-1), start, end, markedAt, delTimeUnsignedInteger);
         }
         boundaryHeapSize += start.unsharedHeapSize() + end.unsharedHeapSize();
@@ -223,6 +238,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
             {
                 if (comparator.compare(tombstones.starts[j], ends[i]) < 0)
                 {
+                    ensureUnshared();
                     insertFrom(i, tombstones.starts[j], tombstones.ends[j], tombstones.markedAts[j], tombstones.delTimesUnsignedIntegers[j]);
                     j++;
                 }
@@ -324,12 +340,14 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     public void updateAllTimestamp(long timestamp)
     {
+        ensureUnshared();
         for (int i = 0; i < size; i++)
             markedAts[i] = timestamp;
     }
 
     public void updateAllTimestampAndLocalDeletionTime(long timestamp, long localDeletionTime)
     {
+        ensureUnshared();
         int unsignedLocalDeletionTime = Cell.deletionTimeLongToUnsignedInteger(localDeletionTime);
         for (int i = 0; i < size; i++)
         {
@@ -676,12 +694,60 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         assert i >= 0;
 
         if (size == capacity())
+        {
+            // growToFree allocates replacement arrays, so a shared copy needs no separate isolation.
             growToFree(i);
+            shared = false;
+        }
         else if (i < size)
+        {
+            ensureUnshared();
             moveElements(i);
+        }
+        else if (shared)
+        {
+            if (addSharedAtEnd(start, end, markedAt, delTimeUnsignedInteger))
+                return;
+
+            ensureUnshared();
+        }
 
         setInternal(i, start, end, markedAt, delTimeUnsignedInteger);
         size++;
+    }
+
+    private boolean addSharedAtEnd(ClusteringBound<?> start, ClusteringBound<?> end, long markedAt, int delTimeUnsignedInteger)
+    {
+        synchronized (starts)
+        {
+            if (starts[size] != null)
+                return false;
+
+            setInternal(size, start, end, markedAt, delTimeUnsignedInteger);
+            size++;
+            return true;
+        }
+    }
+
+    private void ensureUnshared()
+    {
+        if (!shared)
+            return;
+
+        int capacity = capacity();
+        ClusteringBound<?>[] newStarts = new ClusteringBound<?>[capacity];
+        ClusteringBound<?>[] newEnds = new ClusteringBound<?>[capacity];
+        long[] newMarkedAts = new long[capacity];
+        int[] newDelTimesUnsignedIntegers = new int[capacity];
+        System.arraycopy(starts, 0, newStarts, 0, size);
+        System.arraycopy(ends, 0, newEnds, 0, size);
+        System.arraycopy(markedAts, 0, newMarkedAts, 0, size);
+        System.arraycopy(delTimesUnsignedIntegers, 0, newDelTimesUnsignedIntegers, 0, size);
+        starts = newStarts;
+        ends = newEnds;
+        markedAts = newMarkedAts;
+        delTimesUnsignedIntegers = newDelTimesUnsignedIntegers;
+        shared = false;
     }
 
     /*

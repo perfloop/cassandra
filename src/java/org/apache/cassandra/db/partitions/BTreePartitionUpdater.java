@@ -19,6 +19,7 @@
 package org.apache.cassandra.db.partitions;
 
 import org.apache.cassandra.db.DeletionInfo;
+import org.apache.cassandra.db.MutableDeletionInfo;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.ColumnData;
@@ -152,7 +153,7 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
         // Like for rows, we have to clone the update in case internal buffers (when it has range tombstones) reference
         // memory we shouldn't hold into. But we don't ever store this off-heap currently so we just default to the
         // HeapAllocator (rather than using 'allocator').
-        DeletionInfo newInfo = existing.mutableCopy().add(update.clone(HeapCloner.instance));
+        DeletionInfo newInfo = ((MutableDeletionInfo) existing).mutableCopyForBTreePartition().add(update.clone(HeapCloner.instance));
         onAllocatedOnHeap(newInfo.unsharedHeapSize() - existing.unsharedHeapSize());
         return newInfo;
     }

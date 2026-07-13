@@ -26,6 +26,7 @@ import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.utils.ObjectSizes;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 
 public class RangeTombstoneListCopyTest
 {
@@ -75,12 +76,35 @@ public class RangeTombstoneListCopyTest
         assertEquals(3, copy.rangeCount());
     }
 
+    @Test
+    public void btreeCopiesKeepCompetingTailAppendsIndependent()
+    {
+        RangeTombstoneList source = listWithTwoRanges(64);
+        RangeTombstoneList first = source.copyForBTreePartition();
+        RangeTombstoneList second = source.copyForBTreePartition();
+
+        first.add(tombstone(4, 5, 3));
+        second.add(tombstone(6, 7, 4));
+
+        assertEquals(2, source.size());
+        assertEquals(3, first.size());
+        assertEquals(3, second.size());
+        assertEquals(3, first.search(clustering(4)).deletionTime().markedForDeleteAt());
+        assertEquals(4, second.search(clustering(6)).deletionTime().markedForDeleteAt());
+        assertNull(second.search(clustering(4)));
+    }
+
     private static RangeTombstoneList listWithTwoRanges(int capacity)
     {
         RangeTombstoneList list = new RangeTombstoneList(comparator, capacity);
         list.add(tombstone(0, 1, 1));
         list.add(tombstone(2, 3, 2));
         return list;
+    }
+
+    private static Clustering<?> clustering(int value)
+    {
+        return Clustering.make(Int32Type.instance.decompose(value));
     }
 
     private static RangeTombstone tombstone(int start, int end, long timestamp)

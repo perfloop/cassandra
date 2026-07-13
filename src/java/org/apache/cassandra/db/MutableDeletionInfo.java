@@ -84,6 +84,11 @@ public class MutableDeletionInfo implements DeletionInfo
         return new MutableDeletionInfo(partitionDeletion, ranges == null ? null : ranges.copy());
     }
 
+    public MutableDeletionInfo mutableCopyForBTreePartition()
+    {
+        return new MutableDeletionInfo(partitionDeletion, ranges == null ? null : ranges.copyForBTreePartition());
+    }
+
     @Override
     public MutableDeletionInfo clone(ByteBufferCloner cloner)
     {
