@@ -19,6 +19,10 @@
 package org.apache.cassandra.db;
 
 import java.util.Iterator;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -93,6 +97,45 @@ public class RangeTombstoneListCopyTest
         assertTimestamps(original, 1, 2);
         assertTimestamps(firstCopy, 1, 2, 3, 5);
         assertTimestamps(secondCopy, 1, 2, 3, 4);
+    }
+
+    @Test
+    public void concurrentCopiesRemainIndependentAfterAppends() throws Exception
+    {
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try
+        {
+            for (int i = 0; i < 1000; i++)
+            {
+                RangeTombstoneList original = list(2);
+                CyclicBarrier start = new CyclicBarrier(2);
+                CyclicBarrier copiesMade = new CyclicBarrier(2);
+
+                Future<RangeTombstoneList> firstCopy = executor.submit(() -> copyAndAppend(original, start, copiesMade, 10, 3));
+                Future<RangeTombstoneList> secondCopy = executor.submit(() -> copyAndAppend(original, start, copiesMade, 12, 4));
+
+                assertTimestamps(original, 1, 2);
+                assertTimestamps(firstCopy.get(), 1, 2, 3);
+                assertTimestamps(secondCopy.get(), 1, 2, 4);
+            }
+        }
+        finally
+        {
+            executor.shutdownNow();
+        }
+    }
+
+    private static RangeTombstoneList copyAndAppend(RangeTombstoneList original,
+                                                      CyclicBarrier start,
+                                                      CyclicBarrier copiesMade,
+                                                      int rangeStart,
+                                                      long timestamp) throws Exception
+    {
+        start.await();
+        RangeTombstoneList copy = original.copy();
+        copiesMade.await();
+        copy.add(tombstone(rangeStart, rangeStart + 1, timestamp));
+        return copy;
     }
 
     private static RangeTombstoneList list(int count)
