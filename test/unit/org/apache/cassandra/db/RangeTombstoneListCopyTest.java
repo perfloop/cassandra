@@ -67,6 +67,34 @@ public class RangeTombstoneListCopyTest
         assertTimestamps(copy, 3, 1, 2);
     }
 
+    @Test
+    public void copyRemainsIndependentAfterTimestampMutation()
+    {
+        RangeTombstoneList original = list(2);
+        RangeTombstoneList copy = original.copy();
+
+        copy.updateAllTimestamp(3);
+
+        assertTimestamps(original, 1, 2);
+        assertTimestamps(copy, 3, 3);
+    }
+
+    @Test
+    public void copiesCanAppendAcrossGenerations()
+    {
+        RangeTombstoneList original = list(2);
+        RangeTombstoneList firstCopy = original.copy();
+        firstCopy.add(tombstone(10, 11, 3));
+        RangeTombstoneList secondCopy = firstCopy.copy();
+
+        secondCopy.add(tombstone(12, 13, 4));
+        firstCopy.add(tombstone(14, 15, 5));
+
+        assertTimestamps(original, 1, 2);
+        assertTimestamps(firstCopy, 1, 2, 3, 5);
+        assertTimestamps(secondCopy, 1, 2, 3, 4);
+    }
+
     private static RangeTombstoneList list(int count)
     {
         RangeTombstoneList list = new RangeTombstoneList(comparator, 8);
