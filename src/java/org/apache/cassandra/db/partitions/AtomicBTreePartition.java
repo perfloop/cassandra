@@ -159,6 +159,9 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
                 {
                     if (shouldLock)
                     {
+                        if (tryUpdateData(update))
+                            return this;
+
                         synchronized (AtomicBTreePartition.this)
                         {
                             if (tryUpdateData(update))
