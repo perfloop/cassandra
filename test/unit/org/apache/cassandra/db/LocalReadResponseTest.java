@@ -105,6 +105,34 @@ public class LocalReadResponseTest
     }
 
     @Test
+    public void localResponsePreservesMultiPartitionWireData() throws IOException
+    {
+        TableMetadata metadata = regularMetadata();
+        DecoratedKey firstKey = key(metadata, 3);
+        DecoratedKey secondKey = key(metadata, 4);
+        ReadCommand command = SinglePartitionReadCommand.fullPartitionRead(metadata, FBUtilities.nowInSeconds(), firstKey);
+
+        PartitionUpdate.SimpleBuilder firstBuilder = PartitionUpdate.simpleBuilder(metadata, firstKey).timestamp(1L);
+        firstBuilder.row().add("static_value", "first static");
+        firstBuilder.row(1).add("v0", "first value");
+        firstBuilder.addRangeTombstone().start(2).end(4);
+        PartitionUpdate first = firstBuilder.build();
+
+        PartitionUpdate.SimpleBuilder secondBuilder = PartitionUpdate.simpleBuilder(metadata, secondKey).timestamp(2L);
+        secondBuilder.row(5).add("v1", "second value");
+        PartitionUpdate second = secondBuilder.build();
+
+        ReadResponse local = ReadResponse.createDataResponse(partitions(first, second), command);
+        ReadResponse remote = ReadResponse.createRemoteDataResponse(partitions(first, second), ByteBufferUtil.EMPTY_BYTE_BUFFER, true, command, MessagingService.current_version);
+        ByteBuffer expectedWireResponse = serialized(remote);
+
+        assertEquals(expectedWireResponse, serialized(local));
+        assertEquals(digest(remote, command), digest(local, command));
+        assertEquals(digest(remote, command), digest(local, command));
+        assertEquals(expectedWireResponse, serialized(local));
+    }
+
+    @Test
     public void localResponseClearsMarkedCounterContextLikeTheSerializationPath()
     {
         TableMetadata metadata = TableMetadata.builder("ks", "local_response_counter")
@@ -134,6 +162,44 @@ public class LocalReadResponseTest
         ByteBuffer localValue = counterValue(local, command, metadata);
         assertFalse(CounterContext.instance().shouldClearLocal(localValue, ByteBufferAccessor.instance));
         assertEquals(counterValue(remote, command, metadata), localValue);
+    }
+
+    private static UnfilteredPartitionIterator partitions(PartitionUpdate... updates)
+    {
+        return new AbstractUnfilteredPartitionIterator()
+        {
+            private int next;
+
+            public TableMetadata metadata()
+            {
+                return updates[0].metadata();
+            }
+
+            public boolean hasNext()
+            {
+                return next < updates.length;
+            }
+
+            public UnfilteredRowIterator next()
+            {
+                return updates[next++].unfilteredIterator();
+            }
+        };
+    }
+
+    private static ByteBuffer serialized(ReadResponse response) throws IOException
+    {
+        try (DataOutputBuffer out = new DataOutputBuffer())
+        {
+            ReadResponse.serializer.serialize(response, out, MessagingService.current_version);
+            assertEquals(ReadResponse.serializer.serializedSize(response, MessagingService.current_version), out.getLength());
+            return out.buffer().duplicate();
+        }
+    }
+
+    private static ByteBuffer digest(ReadResponse response, ReadCommand command)
+    {
+        return response.digest(command);
     }
 
     private static TableMetadata regularMetadata()

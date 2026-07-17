@@ -20,17 +20,28 @@ package org.apache.cassandra.db;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
+import java.util.NoSuchElementException;
 
 import com.google.common.annotations.VisibleForTesting;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.db.context.CounterContext;
 import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.partitions.AbstractUnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+import org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.DeserializationHelper;
+import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Rows;
+import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataInputPlus;
@@ -232,17 +243,101 @@ public abstract class ReadResponse
         private static final int bufferInitialSizeMin = CassandraRelevantProperties.DATA_RESPONSE_BUFFER_INITIAL_SIZE_MIN.getInt();
         private static final int bufferInitialSizeMax = CassandraRelevantProperties.DATA_RESPONSE_BUFFER_INITIAL_SIZE_MAX.getInt();
 
+        private static final Transformation<UnfilteredRowIterator> CLEAR_LOCAL_COUNTER_CONTEXT = new Transformation<UnfilteredRowIterator>()
+        {
+            @Override
+            protected Row applyToStatic(Row row)
+            {
+                return clearLocalCounterContext(row);
+            }
+
+            @Override
+            protected Row applyToRow(Row row)
+            {
+                return clearLocalCounterContext(row);
+            }
+        };
+
+        private final TableMetadata metadata;
+        private final List<LocalPartition> partitions;
+        private final ColumnFilter selection;
+        private ByteBuffer serializedData;
+
         private LocalDataResponse(UnfilteredPartitionIterator iter, ReadCommand command, RepairedDataInfo rdi)
         {
-            super(build(iter, command.columnFilter()),
+            this(iter.metadata(), materialize(iter), command.columnFilter(), rdi);
+        }
+
+        private LocalDataResponse(TableMetadata metadata,
+                                  List<LocalPartition> partitions,
+                                  ColumnFilter selection,
+                                  RepairedDataInfo rdi)
+        {
+            // materialize() must complete before RepairedDataInfo finalizes its digest.
+            super(ByteBufferUtil.EMPTY_BYTE_BUFFER,
                   rdi.getDigest(), rdi.isConclusive(),
                   MessagingService.current_version,
                   DeserializationHelper.Flag.LOCAL);
+            this.metadata = metadata;
+            this.partitions = partitions;
+            this.selection = selection;
         }
 
         private LocalDataResponse(UnfilteredPartitionIterator iter, ColumnFilter selection)
         {
-            super(build(iter, selection), null, false, MessagingService.current_version, DeserializationHelper.Flag.LOCAL);
+            this(iter.metadata(), materialize(iter), selection);
+        }
+
+        private LocalDataResponse(TableMetadata metadata, List<LocalPartition> partitions, ColumnFilter selection)
+        {
+            super(ByteBufferUtil.EMPTY_BYTE_BUFFER, null, false, MessagingService.current_version, DeserializationHelper.Flag.LOCAL);
+            this.metadata = metadata;
+            this.partitions = partitions;
+            this.selection = selection;
+        }
+
+        @Override
+        public UnfilteredPartitionIterator makeIterator(ReadCommand command)
+        {
+            return new LocalPartitionIterator(metadata, partitions, true);
+        }
+
+        @Override
+        protected ByteBuffer data()
+        {
+            if (serializedData == null)
+                serializedData = build(new LocalPartitionIterator(metadata, partitions, false), selection);
+            return serializedData;
+        }
+
+        private static List<LocalPartition> materialize(UnfilteredPartitionIterator iter)
+        {
+            List<LocalPartition> partitions = new ArrayList<>();
+            while (iter.hasNext())
+            {
+                try (UnfilteredRowIterator partition = iter.next())
+                {
+                    partitions.add(new LocalPartition(partition));
+                }
+            }
+            return partitions;
+        }
+
+        private static Row clearLocalCounterContext(Row row)
+        {
+            return row.transformAndFilter(columnData -> {
+                if (!(columnData instanceof Cell))
+                    return columnData;
+
+                Cell<?> cell = (Cell<?>) columnData;
+                if (!cell.isCounterCell())
+                    return cell;
+
+                ByteBuffer value = cell.buffer();
+                return CounterContext.instance().shouldClearLocal(value, ByteBufferAccessor.instance)
+                       ? cell.withUpdatedValue(CounterContext.instance().clearAllLocal(value, ByteBufferAccessor.instance))
+                       : cell;
+            });
         }
 
         private static ByteBuffer build(UnfilteredPartitionIterator iter, ColumnFilter selection)
@@ -267,6 +362,104 @@ public abstract class ReadResponse
             {
                 // We're serializing in memory so this shouldn't happen
                 throw new RuntimeException(e);
+            }
+        }
+
+        private static class LocalPartition
+        {
+            private final TableMetadata metadata;
+            private final DecoratedKey key;
+            private final DeletionTime partitionDeletion;
+            private final RegularAndStaticColumns columns;
+            private final Row staticRow;
+            private final boolean isReverseOrder;
+            private final EncodingStats stats;
+            private final List<Unfiltered> unfiltereds;
+
+            private LocalPartition(UnfilteredRowIterator partition)
+            {
+                metadata = partition.metadata();
+                key = partition.partitionKey();
+                partitionDeletion = partition.partitionLevelDeletion();
+                columns = partition.columns();
+                staticRow = partition.staticRow();
+                isReverseOrder = partition.isReverseOrder();
+                stats = partition.stats();
+                unfiltereds = new ArrayList<>();
+                while (partition.hasNext())
+                    unfiltereds.add(partition.next());
+            }
+
+            private UnfilteredRowIterator iterator()
+            {
+                return new AbstractUnfilteredRowIterator(metadata,
+                                                         key,
+                                                         partitionDeletion,
+                                                         columns,
+                                                         staticRow,
+                                                         isReverseOrder,
+                                                         stats)
+                {
+                    private final Iterator<Unfiltered> iterator = unfiltereds.iterator();
+
+                    @Override
+                    protected Unfiltered computeNext()
+                    {
+                        return iterator.hasNext() ? iterator.next() : endOfData();
+                    }
+                };
+            }
+        }
+
+        private static class LocalPartitionIterator extends AbstractUnfilteredPartitionIterator
+        {
+            private final TableMetadata metadata;
+            private final Iterator<LocalPartition> partitions;
+            private final boolean clearLocalCounterContext;
+            private UnfilteredRowIterator current;
+
+            private LocalPartitionIterator(TableMetadata metadata, List<LocalPartition> partitions, boolean clearLocalCounterContext)
+            {
+                this.metadata = metadata;
+                this.partitions = partitions.iterator();
+                this.clearLocalCounterContext = clearLocalCounterContext;
+            }
+
+            @Override
+            public TableMetadata metadata()
+            {
+                return metadata;
+            }
+
+            @Override
+            public boolean hasNext()
+            {
+                drainCurrentPartition();
+                return partitions.hasNext();
+            }
+
+            @Override
+            public UnfilteredRowIterator next()
+            {
+                if (!hasNext())
+                    throw new NoSuchElementException();
+
+                current = partitions.next().iterator();
+                return clearLocalCounterContext ? Transformation.apply(current, CLEAR_LOCAL_COUNTER_CONTEXT) : current;
+            }
+
+            @Override
+            public void close()
+            {
+                if (current != null)
+                    current.close();
+            }
+
+            private void drainCurrentPartition()
+            {
+                if (current != null)
+                    while (current.hasNext())
+                        current.next();
             }
         }
     }
@@ -307,9 +500,14 @@ public abstract class ReadResponse
             this.flag = flag;
         }
 
+        protected ByteBuffer data()
+        {
+            return data;
+        }
+
         public UnfilteredPartitionIterator makeIterator(ReadCommand command)
         {
-            try (DataInputBuffer in = new DataInputBuffer(data, true))
+            try (DataInputBuffer in = new DataInputBuffer(data(), true))
             {
                 // Note that the command parameter shadows the 'command' field and this is intended because
                 // the later can be null (for RemoteDataResponse as those are created in the serializers and
@@ -378,7 +576,7 @@ public abstract class ReadResponse
                 ByteBufferUtil.writeWithVIntLength(response.repairedDataDigest(), out);
                 out.writeBoolean(response.isRepairedDigestConclusive());
 
-                ByteBuffer data = ((DataResponse)response).data;
+                ByteBuffer data = ((DataResponse)response).data();
                 ByteBufferUtil.writeWithVIntLength(data, out);
             }
         }
@@ -418,7 +616,7 @@ public abstract class ReadResponse
                 // In theory, we should deserialize/re-serialize if the version asked is different from the current
                 // version as the content could have a different serialization format. So far though, we haven't made
                 // change to partition iterators serialization since 3.0 so we skip this.
-                ByteBuffer data = ((DataResponse)response).data;
+                ByteBuffer data = ((DataResponse)response).data();
                 size += ByteBufferUtil.serializedSizeWithVIntLength(data);
             }
             return size;
