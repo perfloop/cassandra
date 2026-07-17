@@ -781,7 +781,13 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         if (i >= size)
             return;
 
-        ensureWritable();
+        if (copyState != EXCLUSIVE)
+        {
+            // Detach and leave the insertion slot in one copy rather than copying the shared prefix before shifting it.
+            grow(i, capacity());
+            return;
+        }
+
         System.arraycopy(starts, i, starts, i+1, size - i);
         System.arraycopy(ends, i, ends, i+1, size - i);
         System.arraycopy(markedAts, i, markedAts, i+1, size - i);
