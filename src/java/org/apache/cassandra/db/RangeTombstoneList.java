@@ -21,7 +21,6 @@ import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
-import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 import com.google.common.collect.Iterators;
 
@@ -53,11 +52,6 @@ import org.apache.cassandra.utils.memory.ByteBufferCloner;
 public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurableMemory
 {
     private static long EMPTY_SIZE = ObjectSizes.measure(new RangeTombstoneList(null, 0));
-    private static final int EXCLUSIVE = 0;
-    private static final int APPEND_ONLY = 1;
-    private static final int SHARED = 2;
-    private static final AtomicIntegerFieldUpdater<RangeTombstoneList> COPY_STATE_UPDATER =
-        AtomicIntegerFieldUpdater.newUpdater(RangeTombstoneList.class, "copyState");
 
     private final ClusteringComparator comparator;
 
@@ -70,9 +64,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     private long boundaryHeapSize;
     private int size;
-
-    // A copy shares the prefix and transfers ownership of spare array capacity to the returned list.
-    private volatile int copyState;
 
     private RangeTombstoneList(ClusteringComparator comparator,
                                ClusteringBound<?>[] starts,
@@ -114,24 +105,12 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     public RangeTombstoneList copy()
     {
-        while (true)
-        {
-            int state = copyState;
-            if (state == SHARED)
-                return new RangeTombstoneList(comparator,
-                                              Arrays.copyOf(starts, size),
-                                              Arrays.copyOf(ends, size),
-                                              Arrays.copyOf(markedAts, size),
-                                              Arrays.copyOf(delTimesUnsignedIntegers, size),
-                                              boundaryHeapSize, size);
-
-            if (COPY_STATE_UPDATER.compareAndSet(this, state, SHARED))
-            {
-                RangeTombstoneList copy = new RangeTombstoneList(comparator, starts, ends, markedAts, delTimesUnsignedIntegers, boundaryHeapSize, size);
-                copy.copyState = APPEND_ONLY;
-                return copy;
-            }
-        }
+        return new RangeTombstoneList(comparator,
+                                      Arrays.copyOf(starts, size),
+                                      Arrays.copyOf(ends, size),
+                                      Arrays.copyOf(markedAts, size),
+                                      Arrays.copyOf(delTimesUnsignedIntegers, size),
+                                      boundaryHeapSize, size);
     }
 
     public RangeTombstoneList clone(ByteBufferCloner cloner)
@@ -345,14 +324,12 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     public void updateAllTimestamp(long timestamp)
     {
-        ensureWritable();
         for (int i = 0; i < size; i++)
             markedAts[i] = timestamp;
     }
 
     public void updateAllTimestampAndLocalDeletionTime(long timestamp, long localDeletionTime)
     {
-        ensureWritable();
         int unsignedLocalDeletionTime = Cell.deletionTimeLongToUnsignedInteger(localDeletionTime);
         for (int i = 0; i < size; i++)
         {
@@ -552,7 +529,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     private static void copyArrays(RangeTombstoneList src, RangeTombstoneList dst)
     {
-        dst.ensureWritable();
         dst.grow(src.size);
         System.arraycopy(src.starts, 0, dst.starts, 0, src.size);
         System.arraycopy(src.ends, 0, dst.ends, 0, src.size);
@@ -560,6 +536,23 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         System.arraycopy(src.delTimesUnsignedIntegers, 0, dst.delTimesUnsignedIntegers, 0, src.size);
         dst.size = src.size;
         dst.boundaryHeapSize = src.boundaryHeapSize;
+    }
+
+    /**
+     * Appends an ordered, non-overlapping list without creating intermediate RangeTombstone objects. Package-private
+     * so MutableDeletionInfo can materialize its immutable prefix chain directly into the final allocation.
+     */
+    void appendOrdered(RangeTombstoneList source)
+    {
+        int offset = size;
+        int newSize = offset + source.size;
+        grow(newSize);
+        System.arraycopy(source.starts, 0, starts, offset, source.size);
+        System.arraycopy(source.ends, 0, ends, offset, source.size);
+        System.arraycopy(source.markedAts, 0, markedAts, offset, source.size);
+        System.arraycopy(source.delTimesUnsignedIntegers, 0, delTimesUnsignedIntegers, offset, source.size);
+        size = newSize;
+        boundaryHeapSize += source.boundaryHeapSize;
     }
 
     /*
@@ -737,7 +730,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         ends = grow(ends, size, newLength, i);
         markedAts = grow(markedAts, size, newLength, i);
         delTimesUnsignedIntegers = grow(delTimesUnsignedIntegers, size, newLength, i);
-        copyState = EXCLUSIVE;
     }
 
     private static ClusteringBound<?>[] grow(ClusteringBound<?>[] a, int size, int newLength, int i)
@@ -781,13 +773,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         if (i >= size)
             return;
 
-        if (copyState != EXCLUSIVE)
-        {
-            // Detach and leave the insertion slot in one copy rather than copying the shared prefix before shifting it.
-            grow(i, capacity());
-            return;
-        }
-
         System.arraycopy(starts, i, starts, i+1, size - i);
         System.arraycopy(ends, i, ends, i+1, size - i);
         System.arraycopy(markedAts, i, markedAts, i+1, size - i);
@@ -799,7 +784,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     private void setInternal(int i, ClusteringBound<?> start, ClusteringBound<?> end, long markedAt, int delTimeUnsignedInteger)
     {
-        ensureWritable(i);
         if (starts[i] != null)
             boundaryHeapSize -= starts[i].unsharedHeapSize() + ends[i].unsharedHeapSize();
         starts[i] = start;
@@ -807,34 +791,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         markedAts[i] = markedAt;
         delTimesUnsignedIntegers[i] = delTimeUnsignedInteger;
         boundaryHeapSize += start.unsharedHeapSize() + end.unsharedHeapSize();
-    }
-
-    private void ensureWritable()
-    {
-        ensureWritable(-1);
-    }
-
-    private void ensureWritable(int index)
-    {
-        int state = copyState;
-        if (state == EXCLUSIVE || (state == APPEND_ONLY && index >= size))
-            return;
-
-        ClusteringBound<?>[] newStarts = new ClusteringBound<?>[capacity()];
-        ClusteringBound<?>[] newEnds = new ClusteringBound<?>[capacity()];
-        long[] newMarkedAts = new long[capacity()];
-        int[] newDelTimesUnsignedIntegers = new int[capacity()];
-
-        System.arraycopy(starts, 0, newStarts, 0, size);
-        System.arraycopy(ends, 0, newEnds, 0, size);
-        System.arraycopy(markedAts, 0, newMarkedAts, 0, size);
-        System.arraycopy(delTimesUnsignedIntegers, 0, newDelTimesUnsignedIntegers, 0, size);
-
-        starts = newStarts;
-        ends = newEnds;
-        markedAts = newMarkedAts;
-        delTimesUnsignedIntegers = newDelTimesUnsignedIntegers;
-        copyState = EXCLUSIVE;
     }
 
     @Override

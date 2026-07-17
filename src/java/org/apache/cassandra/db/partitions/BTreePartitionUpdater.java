@@ -19,6 +19,7 @@
 package org.apache.cassandra.db.partitions;
 
 import org.apache.cassandra.db.DeletionInfo;
+import org.apache.cassandra.db.MutableDeletionInfo;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.ColumnData;
@@ -152,8 +153,14 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
         // Like for rows, we have to clone the update in case internal buffers (when it has range tombstones) reference
         // memory we shouldn't hold into. But we don't ever store this off-heap currently so we just default to the
         // HeapAllocator (rather than using 'allocator').
-        DeletionInfo newInfo = existing.mutableCopy().add(update.clone(HeapCloner.instance));
-        onAllocatedOnHeap(newInfo.unsharedHeapSize() - existing.unsharedHeapSize());
+        // MutableDeletionInfo's memtable copy retains the immutable range prefix and owns only the added suffix.
+        // Account the complete retained graph so a successful append charges its new suffix, while a materialized
+        // non-append replacement releases the prefix it no longer references.
+        MutableDeletionInfo existingMutable = (MutableDeletionInfo) existing;
+        long existingHeapSize = existingMutable.retainedHeapSize();
+        MutableDeletionInfo newInfo = existingMutable.mutableCopyForMemtable();
+        newInfo.add(update.clone(HeapCloner.instance));
+        onAllocatedOnHeap(newInfo.retainedHeapSize() - existingHeapSize);
         return newInfo;
     }
 

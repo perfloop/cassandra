@@ -18,6 +18,7 @@
  */
 package org.apache.cassandra.db;
 
+import java.lang.reflect.Field;
 import java.util.Iterator;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
@@ -32,6 +33,8 @@ import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 public class RangeTombstoneListCopyTest
 {
@@ -57,6 +60,93 @@ public class RangeTombstoneListCopyTest
         assertTimestamps(original, 1, 2, 5);
         assertTimestamps(firstCopy, 1, 2, 3);
         assertTimestamps(secondCopy, 1, 2, 4);
+    }
+
+    @Test
+    public void appendedCopyDoesNotRetainBoundsInParentSpareCapacity() throws Exception
+    {
+        RangeTombstoneList original = list(2);
+        RangeTombstoneList copy = original.copy();
+
+        copy.add(tombstone(10, 11, 3));
+
+        assertTimestamps(original, 1, 2);
+        assertUnusedBoundsAreNull(original);
+    }
+
+    @Test
+    public void memtableCopyChargesAnOrderedSuffixOnce() throws Exception
+    {
+        RangeTombstoneList prefix = list(2);
+        MutableDeletionInfo original = new MutableDeletionInfo(DeletionTime.LIVE, prefix);
+        MutableDeletionInfo suffix = deletion(tombstone(10, 11, 3));
+        long expectedRetainedSize = original.unsharedHeapSize() + suffix.unsharedHeapSize();
+
+        MutableDeletionInfo copy = original.mutableCopyForMemtable();
+        copy.add(suffix);
+
+        assertTimestamps(original, 1, 2);
+        assertTimestamps(copy, 1, 2, 3);
+        assertEquals(expectedRetainedSize, copy.retainedHeapSize());
+        assertUnusedBoundsAreNull(prefix);
+    }
+
+    @Test
+    public void prefixMergeDetachesAndAccountsForReplacementArrays() throws Exception
+    {
+        RangeTombstoneList prefix = list(2);
+        MutableDeletionInfo original = new MutableDeletionInfo(DeletionTime.LIVE, prefix);
+        MutableDeletionInfo copy = original.mutableCopyForMemtable();
+        long copyBeforeMerge = copy.unsharedHeapSize();
+
+        copy.add(deletion(tombstone(0, 1, 3)));
+
+        assertTimestamps(original, 1, 2);
+        assertTimestamps(copy, 3, 1, 2);
+        assertTrue(copy.unsharedHeapSize() > copyBeforeMerge);
+        assertEquals(copy.unsharedHeapSize(), copy.retainedHeapSize());
+        assertUnusedBoundsAreNull(prefix);
+    }
+
+    @Test
+    public void discardedMemtableMergeChildDoesNotRetainItsSuffixInPrefix() throws Exception
+    {
+        RangeTombstoneList prefix = list(2);
+        MutableDeletionInfo original = new MutableDeletionInfo(DeletionTime.LIVE, prefix);
+        MutableDeletionInfo winningUpdate = deletion(tombstone(10, 11, 3));
+        MutableDeletionInfo losingUpdate = deletion(tombstone(12, 13, 4));
+        long originalRetainedSize = original.retainedHeapSize();
+
+        MutableDeletionInfo winner = original.mutableCopyForMemtable();
+        winner.add(winningUpdate);
+        MutableDeletionInfo discarded = original.mutableCopyForMemtable();
+        discarded.add(losingUpdate);
+
+        assertTimestamps(original, 1, 2);
+        assertTimestamps(winner, 1, 2, 3);
+        assertTimestamps(discarded, 1, 2, 4);
+        assertEquals(originalRetainedSize, original.retainedHeapSize());
+        assertEquals(original.unsharedHeapSize() + winningUpdate.unsharedHeapSize(), winner.retainedHeapSize());
+        assertEquals(original.unsharedHeapSize() + losingUpdate.unsharedHeapSize(), discarded.retainedHeapSize());
+        assertUnusedBoundsAreNull(prefix);
+    }
+
+    @Test
+    public void longMemtableMergeChainRemainsIterable()
+    {
+        final int rangeCount = 4096;
+        MutableDeletionInfo merged = MutableDeletionInfo.live();
+        for (int i = 0; i < rangeCount; i++)
+        {
+            MutableDeletionInfo next = merged.mutableCopyForMemtable();
+            next.add(deletion(tombstone(i * 2, i * 2 + 1, i + 1)));
+            merged = next;
+        }
+
+        assertEquals(rangeCount, merged.rangeCount());
+        assertEquals(rangeCount, count(merged.rangeIterator(false)));
+        assertTrue(merged.retainedHeapSize() > 0);
+        assertEquals(rangeCount, merged.mutableCopy().rangeCount());
     }
 
     @Test
@@ -125,6 +215,34 @@ public class RangeTombstoneListCopyTest
         }
     }
 
+    @Test
+    public void concurrentMemtableCopiesKeepTheirSuffixesPrivate() throws Exception
+    {
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try
+        {
+            for (int i = 0; i < 1000; i++)
+            {
+                RangeTombstoneList prefix = list(2);
+                MutableDeletionInfo original = new MutableDeletionInfo(DeletionTime.LIVE, prefix);
+                CyclicBarrier start = new CyclicBarrier(2);
+                CyclicBarrier copiesMade = new CyclicBarrier(2);
+
+                Future<MutableDeletionInfo> firstCopy = executor.submit(() -> copyAndAppend(original, start, copiesMade, 10, 3));
+                Future<MutableDeletionInfo> secondCopy = executor.submit(() -> copyAndAppend(original, start, copiesMade, 12, 4));
+
+                assertTimestamps(original, 1, 2);
+                assertTimestamps(firstCopy.get(), 1, 2, 3);
+                assertTimestamps(secondCopy.get(), 1, 2, 4);
+                assertUnusedBoundsAreNull(prefix);
+            }
+        }
+        finally
+        {
+            executor.shutdownNow();
+        }
+    }
+
     private static RangeTombstoneList copyAndAppend(RangeTombstoneList original,
                                                       CyclicBarrier start,
                                                       CyclicBarrier copiesMade,
@@ -136,6 +254,26 @@ public class RangeTombstoneListCopyTest
         copiesMade.await();
         copy.add(tombstone(rangeStart, rangeStart + 1, timestamp));
         return copy;
+    }
+
+    private static MutableDeletionInfo copyAndAppend(MutableDeletionInfo original,
+                                                       CyclicBarrier start,
+                                                       CyclicBarrier copiesMade,
+                                                       int rangeStart,
+                                                       long timestamp) throws Exception
+    {
+        start.await();
+        MutableDeletionInfo copy = original.mutableCopyForMemtable();
+        copiesMade.await();
+        copy.add(deletion(tombstone(rangeStart, rangeStart + 1, timestamp)));
+        return copy;
+    }
+
+    private static MutableDeletionInfo deletion(RangeTombstone tombstone)
+    {
+        MutableDeletionInfo deletion = MutableDeletionInfo.live();
+        deletion.add(tombstone, comparator);
+        return deletion;
     }
 
     private static RangeTombstoneList list(int count)
@@ -153,6 +291,17 @@ public class RangeTombstoneListCopyTest
                                   DeletionTime.build(timestamp, 1));
     }
 
+    private static int count(Iterator<RangeTombstone> tombstones)
+    {
+        int count = 0;
+        while (tombstones.hasNext())
+        {
+            tombstones.next();
+            count++;
+        }
+        return count;
+    }
+
     private static void assertTimestamps(RangeTombstoneList list, long... timestamps)
     {
         assertEquals(timestamps.length, list.size());
@@ -160,5 +309,30 @@ public class RangeTombstoneListCopyTest
         Iterator<RangeTombstone> tombstones = list.iterator();
         for (long timestamp : timestamps)
             assertEquals(timestamp, tombstones.next().deletionTime().markedForDeleteAt());
+    }
+
+    private static void assertTimestamps(DeletionInfo deletion, long... timestamps)
+    {
+        assertEquals(timestamps.length, deletion.rangeCount());
+
+        Iterator<RangeTombstone> tombstones = deletion.rangeIterator(false);
+        for (long timestamp : timestamps)
+            assertEquals(timestamp, tombstones.next().deletionTime().markedForDeleteAt());
+    }
+
+    private static void assertUnusedBoundsAreNull(RangeTombstoneList list) throws Exception
+    {
+        Field starts = RangeTombstoneList.class.getDeclaredField("starts");
+        Field ends = RangeTombstoneList.class.getDeclaredField("ends");
+        starts.setAccessible(true);
+        ends.setAccessible(true);
+
+        Object[] startBounds = (Object[]) starts.get(list);
+        Object[] endBounds = (Object[]) ends.get(list);
+        for (int i = list.size(); i < startBounds.length; i++)
+        {
+            assertNull(startBounds[i]);
+            assertNull(endBounds[i]);
+        }
     }
 }
