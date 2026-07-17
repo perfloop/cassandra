@@ -153,14 +153,14 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
         // Like for rows, we have to clone the update in case internal buffers (when it has range tombstones) reference
         // memory we shouldn't hold into. But we don't ever store this off-heap currently so we just default to the
         // HeapAllocator (rather than using 'allocator').
-        // MutableDeletionInfo's memtable copy retains the immutable range prefix and owns only the added suffix.
-        // Account the complete retained graph so a successful append charges its new suffix, while a materialized
-        // non-append replacement releases the prefix it no longer references.
-        MutableDeletionInfo existingMutable = (MutableDeletionInfo) existing;
-        long existingHeapSize = existingMutable.retainedHeapSize();
-        MutableDeletionInfo newInfo = existingMutable.mutableCopyForMemtable();
+        // Only an ordered, non-overlapping update gets the persistent range snapshot. All other updates retain
+        // the flat copy and merge behavior, avoiding a representation change on prefix and overlap workloads.
+        MutableDeletionInfo existingInfo = (MutableDeletionInfo) existing;
+        MutableDeletionInfo newInfo = existingInfo.mutableCopyForMemtable(update);
         newInfo.add(update.clone(HeapCloner.instance));
-        onAllocatedOnHeap(newInfo.retainedHeapSize() - existingHeapSize);
+        onAllocatedOnHeap(newInfo.memtableUnsharedHeapSize()
+                          - existingInfo.memtableUnsharedHeapSize()
+                          + newInfo.treeAllocatedOnHeap());
         return newInfo;
     }
 
