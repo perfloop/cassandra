@@ -38,6 +38,7 @@ import org.apache.cassandra.db.rows.DeserializationHelper;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.rows.WrappingUnfilteredRowIterator;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputBuffer;
@@ -49,6 +50,7 @@ import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.ExpMovingAverage;
 import org.apache.cassandra.utils.MovingAverage;
+import org.apache.cassandra.utils.memory.EnsureOnHeap;
 
 import static org.apache.cassandra.db.RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO;
 
@@ -63,7 +65,12 @@ public abstract class ReadResponse
 
     public static ReadResponse createDataResponse(UnfilteredPartitionIterator data, ReadCommand command, RepairedDataInfo rdi)
     {
-        return new LocalDataResponse(data, command, rdi);
+        return new LocalDataResponse(data, command, rdi, true);
+    }
+
+    static ReadResponse createDataResponseForLocalRead(UnfilteredPartitionIterator data, ReadCommand command, RepairedDataInfo rdi)
+    {
+        return new LocalDataResponse(data, command, rdi, false);
     }
 
     static ReadResponse createDataResponseForRemote(UnfilteredPartitionIterator data, ReadCommand command, RepairedDataInfo rdi)
@@ -73,7 +80,7 @@ public abstract class ReadResponse
 
     public static ReadResponse createDataResponse(UnfilteredPartitionIterator data, ReadCommand command)
     {
-        return new LocalDataResponse(data, command, NO_OP_REPAIRED_DATA_INFO);
+        return new LocalDataResponse(data, command, NO_OP_REPAIRED_DATA_INFO, true);
     }
 
     public static ReadResponse createSimpleDataResponse(UnfilteredPartitionIterator data, ColumnFilter selection)
@@ -252,15 +259,18 @@ public abstract class ReadResponse
         private final boolean isReversed;
         private volatile ByteBuffer serializedData;
 
-        private LocalDataResponse(UnfilteredPartitionIterator iter, ReadCommand command, RepairedDataInfo rdi)
+        private LocalDataResponse(UnfilteredPartitionIterator iter,
+                                  ReadCommand command,
+                                  RepairedDataInfo rdi,
+                                  boolean copyValues)
         {
             // Argument evaluation materializes the iterator before it queries RepairedDataInfo.
-            this(materialize(iter), command.columnFilter(), command.isReversed(), rdi.getDigest(), rdi.isConclusive());
+            this(materialize(iter, copyValues), command.columnFilter(), command.isReversed(), rdi.getDigest(), rdi.isConclusive());
         }
 
         private LocalDataResponse(UnfilteredPartitionIterator iter, ColumnFilter selection)
         {
-            this(materialize(iter), selection);
+            this(materialize(iter, true), selection);
         }
 
         private LocalDataResponse(MaterializedData data, ColumnFilter selection)
@@ -281,7 +291,7 @@ public abstract class ReadResponse
             this.isReversed = isReversed;
         }
 
-        private static MaterializedData materialize(UnfilteredPartitionIterator iter)
+        private static MaterializedData materialize(UnfilteredPartitionIterator iter, boolean copyValues)
         {
             List<ImmutableBTreePartition> partitions = new ArrayList<>();
             boolean isReversed = false;
@@ -294,10 +304,31 @@ public abstract class ReadResponse
                     else
                         assert isReversed == partition.isReverseOrder();
 
-                    partitions.add(ImmutableBTreePartition.create(clearLocalCounterContexts(partition)));
+                    UnfilteredRowIterator contents = copyValues ? cloneToHeap(partition) : partition;
+                    partitions.add(ImmutableBTreePartition.create(clearLocalCounterContexts(contents)));
                 }
             }
             return new MaterializedData(iter.metadata(), partitions, isReversed);
+        }
+
+        private static UnfilteredRowIterator cloneToHeap(UnfilteredRowIterator partition)
+        {
+            UnfilteredRowIterator copy = EnsureOnHeap.CLONE_TO_HEAP.applyToPartition(partition);
+            DecoratedKey key = EnsureOnHeap.CLONE_TO_HEAP.applyToPartitionKey(partition.partitionKey());
+            return new WrappingUnfilteredRowIterator()
+            {
+                @Override
+                public UnfilteredRowIterator wrapped()
+                {
+                    return copy;
+                }
+
+                @Override
+                public DecoratedKey partitionKey()
+                {
+                    return key;
+                }
+            };
         }
 
         private static UnfilteredRowIterator clearLocalCounterContexts(UnfilteredRowIterator partition)

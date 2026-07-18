@@ -651,6 +651,7 @@ public enum CassandraRelevantProperties
     TEST_JVM_DTEST_DISABLE_SSL("cassandra.test.disable_ssl"),
     TEST_JVM_SHUTDOWN_MESSAGING_GRACEFULLY("cassandra.test.messagingService.gracefulShutdown", "false"),
     TEST_LEGACY_SSTABLE_ROOT("legacy-sstable-root"),
+    TEST_LOCAL_RESPONSE_REQUIRE_OFFHEAP("cassandra.test.local_response.require_offheap", "false"),
     TEST_ORG_CAFFINITAS_OHC_SEGMENTCOUNT("org.caffinitas.ohc.segmentCount"),
     TEST_PRESERVE_THREAD_CREATION_STACKTRACE("cassandra.test.preserve_thread_creation_stacktrace", "false"),
     TEST_RANDOM_SEED("cassandra.test.random.seed"),

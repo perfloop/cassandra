@@ -37,13 +37,20 @@ import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.CounterColumnType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.partitions.SingletonUnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator;
 import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.NativeCell;
+import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Rows;
+import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.rows.WrappingUnfilteredRowIterator;
 import org.apache.cassandra.dht.Murmur3Partitioner;
@@ -54,6 +61,10 @@ import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.utils.memory.NativeAllocator;
+import org.apache.cassandra.utils.memory.NativePool;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -268,6 +279,109 @@ public class ReadResponseTest
     }
 
     @Test
+    public void clearsMarkedNativeCounterContextsBeforeRetainingResponse()
+    {
+        TableMetadata counterMetadata = counterMetadata();
+        int key = key();
+        ReadCommand command = command(key, counterMetadata);
+        ByteBuffer marked = CounterContext.instance().markLocalToBeCleared(CounterContext.instance().createLocal(1));
+        assertTrue(CounterContext.instance().shouldClearLocal(marked, ByteBufferAccessor.instance));
+
+        OpOrder.Group group = new OpOrder().start();
+        NativeAllocator allocator = new NativePool(Integer.MAX_VALUE,
+                                                    Integer.MAX_VALUE,
+                                                    1.0f,
+                                                    () -> ImmediateFuture.success(true)).newAllocator(null);
+        ReadResponse response;
+        try
+        {
+            response = command.createResponse(nativeCounterPartitions(counterMetadata, key, marked, allocator, group),
+                                              RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO);
+        }
+        finally
+        {
+            group.close();
+        }
+
+        ByteBuffer cleared = clearedCounterContext(response, command);
+        assertEquals(cleared, clearedCounterContext(response, command));
+        for (MessagingService.Version version : MessagingService.Version.supportedVersions())
+            assertEquals(cleared, clearedCounterContext(roundTripSerialization(response, version.value), command));
+    }
+
+    @Test
+    public void copiesNativeCellsBeforeRetainingResponse()
+    {
+        int key = key();
+        ReadCommand command = command(key, metadata);
+        ByteBuffer value = ByteBufferUtil.bytes(1);
+        OpOrder.Group group = new OpOrder().start();
+        NativeAllocator allocator = new NativePool(Integer.MAX_VALUE,
+                                                    Integer.MAX_VALUE,
+                                                    1.0f,
+                                                    () -> ImmediateFuture.success(true)).newAllocator(null);
+        ReadResponse response;
+        try
+        {
+            response = command.createResponse(nativePartitions(metadata, key, "v", value, allocator, group),
+                                              RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO);
+        }
+        finally
+        {
+            group.close();
+        }
+
+        Cell<?> cell = onlyCell(response, command);
+        assertFalse(cell instanceof NativeCell);
+        assertEquals(value, cell.buffer());
+        for (MessagingService.Version version : MessagingService.Version.supportedVersions())
+            assertEquals(value, onlyCell(roundTripSerialization(response, version.value), command).buffer());
+    }
+
+    @Test
+    public void copiesEphemeralIteratorContentsBeforeSourceClose()
+    {
+        TableMetadata lifetimeMetadata = TableMetadata.builder("ks", "lifetime")
+                                                       .offline()
+                                                       .addPartitionKeyColumn("p", BytesType.instance)
+                                                       .addClusteringColumn("c", BytesType.instance)
+                                                       .addStaticColumn("s", BytesType.instance)
+                                                       .addRegularColumn("v", BytesType.instance)
+                                                       .partitioner(Murmur3Partitioner.instance)
+                                                       .build();
+        byte[] key = new byte[]{ 1 };
+        byte[] staticValue = new byte[]{ 2 };
+        byte[] rowClustering = new byte[]{ 3 };
+        byte[] rowValue = new byte[]{ 4 };
+        byte[] markerStart = new byte[]{ 5 };
+        byte[] markerEnd = new byte[]{ 9 };
+        byte[] secondRowClustering = new byte[]{ 11 };
+        byte[] secondRowValue = new byte[]{ 12 };
+
+        PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(lifetimeMetadata, ByteBuffer.wrap(key));
+        builder.timestamp(1L);
+        builder.row().add("s", ByteBuffer.wrap(staticValue));
+        builder.row(ByteBuffer.wrap(rowClustering)).add("v", ByteBuffer.wrap(rowValue));
+        builder.row(ByteBuffer.wrap(secondRowClustering)).add("v", ByteBuffer.wrap(secondRowValue));
+        builder.addRangeTombstone().start(ByteBuffer.wrap(markerStart)).end(ByteBuffer.wrap(markerEnd));
+        PartitionUpdate update = builder.build();
+        ReadCommand command = command(0, lifetimeMetadata);
+
+        ReadResponse response = command.createResponse(invalidateWhileAdvancing(update.unfilteredIterator(),
+                                                                                  new byte[][]{ key, staticValue },
+                                                                                  new byte[][]{ rowClustering, rowValue },
+                                                                                  new byte[][]{ markerStart },
+                                                                                  new byte[][]{ markerEnd },
+                                                                                  new byte[][]{ secondRowClustering, secondRowValue }),
+                                                        RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO);
+
+        assertLifetimeContents(response, command);
+        assertLifetimeContents(response, command);
+        for (MessagingService.Version version : MessagingService.Version.supportedVersions())
+            assertLifetimeContents(roundTripSerialization(response, version.value), command);
+    }
+
+    @Test
     public void simpleDataResponsePreservesSourceOrderAfterSerialization()
     {
         TableMetadata clusteredMetadata = clusteredMetadata();
@@ -311,6 +425,150 @@ public class ReadResponseTest
         assertPartitionContents(materialized, command, expectedKeys, expectedRows);
         for (MessagingService.Version version : MessagingService.Version.supportedVersions())
             assertPartitionContents(roundTripSerialization(materialized, version.value), command, expectedKeys, expectedRows);
+    }
+
+    private static UnfilteredPartitionIterator invalidateWhileAdvancing(UnfilteredRowIterator source,
+                                                                         byte[][] closeValues,
+                                                                         byte[][]... valuesByItem)
+    {
+        UnfilteredRowIterator invalidating = new WrappingUnfilteredRowIterator()
+        {
+            private int item;
+            private byte[][] previous;
+
+            @Override
+            public UnfilteredRowIterator wrapped()
+            {
+                return source;
+            }
+
+            @Override
+            public boolean hasNext()
+            {
+                boolean hasNext = source.hasNext();
+                if (!hasNext)
+                    invalidate(previous);
+                return hasNext;
+            }
+
+            @Override
+            public Unfiltered next()
+            {
+                invalidate(previous);
+                Unfiltered next = source.next();
+                previous = valuesByItem[item++];
+                return next;
+            }
+
+            @Override
+            public void close()
+            {
+                try
+                {
+                    invalidate(previous);
+                    for (byte[] value : closeValues)
+                        Arrays.fill(value, (byte) 127);
+                }
+                finally
+                {
+                    source.close();
+                }
+            }
+
+            private void invalidate(byte[][] values)
+            {
+                if (values != null)
+                {
+                    for (byte[] value : values)
+                        Arrays.fill(value, (byte) 127);
+                }
+            }
+        };
+        return new SingletonUnfilteredPartitionIterator(invalidating);
+    }
+
+    private static void assertLifetimeContents(ReadResponse response, ReadCommand command)
+    {
+        try (UnfilteredPartitionIterator partitions = response.makeIterator(command))
+        {
+            assertTrue(partitions.hasNext());
+            try (UnfilteredRowIterator partition = partitions.next())
+            {
+                assertEquals(1, Byte.toUnsignedInt(partition.partitionKey().getKey().get(0)));
+                assertEquals(2, Byte.toUnsignedInt(partition.staticRow().cells().iterator().next().buffer().get(0)));
+
+                int rows = 0;
+                int markers = 0;
+                while (partition.hasNext())
+                {
+                    Unfiltered unfiltered = partition.next();
+                    if (unfiltered.isRow())
+                    {
+                        Row row = (Row) unfiltered;
+                        assertEquals(rows == 0 ? 3 : 11, Byte.toUnsignedInt(row.clustering().bufferAt(0).get(0)));
+                        assertEquals(rows == 0 ? 4 : 12, Byte.toUnsignedInt(row.cells().iterator().next().buffer().get(0)));
+                        rows++;
+                    }
+                    else
+                    {
+                        RangeTombstoneMarker marker = (RangeTombstoneMarker) unfiltered;
+                        assertEquals(markers == 0 ? 5 : 9, Byte.toUnsignedInt(marker.clustering().bufferAt(0).get(0)));
+                        markers++;
+                    }
+                }
+                assertEquals(2, rows);
+                assertEquals(2, markers);
+            }
+            assertFalse(partitions.hasNext());
+        }
+    }
+
+    private static UnfilteredPartitionIterator nativeCounterPartitions(TableMetadata metadata,
+                                                                       int key,
+                                                                       ByteBuffer marked,
+                                                                       NativeAllocator allocator,
+                                                                       OpOrder.Group group)
+    {
+        return nativePartitions(metadata, key, "c", marked, allocator, group);
+    }
+
+    private static UnfilteredPartitionIterator nativePartitions(TableMetadata metadata,
+                                                                int key,
+                                                                String column,
+                                                                ByteBuffer value,
+                                                                NativeAllocator allocator,
+                                                                OpOrder.Group group)
+    {
+        PartitionUpdate update = new RowUpdateBuilder(metadata, 1L, key).add(column, value).buildUpdate();
+        final Row nativeRow;
+        try (UnfilteredRowIterator source = update.unfilteredIterator())
+        {
+            assertTrue(source.hasNext());
+            nativeRow = ((Row) source.next()).clone(allocator.cloner(group));
+        }
+        assertTrue(nativeRow.cells().iterator().next() instanceof NativeCell);
+
+        UnfilteredRowIterator iterator = new AbstractUnfilteredRowIterator(metadata,
+                                                                            update.partitionKey(),
+                                                                            DeletionTime.LIVE,
+                                                                            metadata.regularAndStaticColumns(),
+                                                                            Rows.EMPTY_STATIC_ROW,
+                                                                            false,
+                                                                            EncodingStats.NO_STATS)
+        {
+            private boolean returned;
+
+            @Override
+            protected Unfiltered computeNext()
+            {
+                if (returned)
+                    return endOfData();
+
+                returned = true;
+                return nativeRow;
+            }
+        };
+        return new SingletonUnfilteredPartitionIterator(iterator);
     }
 
     private static UnfilteredPartitionIterator trackingPartitions(PartitionUpdate update, SourceConsumption sourceConsumption)

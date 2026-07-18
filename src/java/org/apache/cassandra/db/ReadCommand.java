@@ -437,16 +437,28 @@ public abstract class ReadCommand extends AbstractReadQuery
 
     public ReadResponse createResponse(UnfilteredPartitionIterator iterator, RepairedDataInfo rdi)
     {
-        return createResponse(iterator, rdi, false);
+        return createResponse(iterator, rdi, false, false);
+    }
+
+    /**
+     * Creates a response from this command's ordinary local-read path. Local reads already return heap-owned values,
+     * so materialization can retain their rows without a second value copy.
+     */
+    public ReadResponse createResponseForLocalRead(UnfilteredPartitionIterator iterator, RepairedDataInfo rdi)
+    {
+        return createResponse(iterator, rdi, false, true);
     }
 
     // Remote replicas send their response over the wire rather than replaying it on this coordinator.
     ReadResponse createResponseForRemote(UnfilteredPartitionIterator iterator, RepairedDataInfo rdi)
     {
-        return createResponse(iterator, rdi, true);
+        return createResponse(iterator, rdi, true, false);
     }
 
-    private ReadResponse createResponse(UnfilteredPartitionIterator iterator, RepairedDataInfo rdi, boolean isForRemote)
+    private ReadResponse createResponse(UnfilteredPartitionIterator iterator,
+                                        RepairedDataInfo rdi,
+                                        boolean isForRemote,
+                                        boolean isForLocalRead)
     {
         // validate that the sequence of RT markers is correct: open is followed by close, deletion times for both
         // ends equal, and there are no dangling RT bound in any partition.
@@ -457,7 +469,9 @@ public abstract class ReadCommand extends AbstractReadQuery
 
         return isForRemote
                ? ReadResponse.createDataResponseForRemote(iterator, this, rdi)
-               : ReadResponse.createDataResponse(iterator, this, rdi);
+               : isForLocalRead
+                 ? ReadResponse.createDataResponseForLocalRead(iterator, this, rdi)
+                 : ReadResponse.createDataResponse(iterator, this, rdi);
     }
 
     public ReadResponse createEmptyResponse()

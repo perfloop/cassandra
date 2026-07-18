@@ -24,15 +24,29 @@ import java.nio.charset.StandardCharsets;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.ReadExecutionController;
+import org.apache.cassandra.db.ReadResponse;
+import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.db.SinglePartitionReadCommand;
+import org.apache.cassandra.db.context.CounterContext;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
 import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.transport.Dispatcher;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
+import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_LOCAL_RESPONSE_REQUIRE_OFFHEAP;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -59,6 +73,78 @@ public class CoordinatorLocalReadResponseTest extends CQLTester
 
         assertCoordinatorRead(keyspace, table, false);
         assertCoordinatorRead(keyspace, table, true);
+    }
+
+    @Test
+    public void retainsMaterializedResponseAfterSourceReleaseAndMemtableFlush() throws Throwable
+    {
+        assertOffHeapObjectsIfRequested();
+        String keyspace = createKeyspace("CREATE KEYSPACE %s WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 } AND durable_writes = false");
+        String table = createTable(keyspace, "CREATE TABLE %s (pk int PRIMARY KEY, v text)");
+        executeInternal("INSERT INTO " + keyspace + '.' + table + " (pk, v) VALUES (0, 'before-flush')");
+
+        SinglePartitionReadCommand command = parseReadCommandGroup("SELECT v FROM " + keyspace + '.' + table + " WHERE pk = 0").queries.get(0);
+        ReadResponse response = materializeLocalResponse(command);
+        ByteBuffer digest = response.digest(command);
+
+        getColumnFamilyStore(keyspace, table).forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
+
+        assertEquals(ByteBufferUtil.bytes("before-flush"), onlyCell(response, command).buffer());
+        assertEquals(digest, response.digest(command));
+    }
+
+    @Test
+    public void clearsMarkedNativeCounterContextBeforeSourceRelease() throws Throwable
+    {
+        assertOffHeapObjectsIfRequested();
+        String keyspace = createKeyspace("CREATE KEYSPACE %s WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 } AND durable_writes = false");
+        String table = createTable(keyspace, "CREATE TABLE %s (pk int PRIMARY KEY, c counter)");
+        SinglePartitionReadCommand command = parseReadCommandGroup("SELECT c FROM " + keyspace + '.' + table + " WHERE pk = 0").queries.get(0);
+        ByteBuffer marked = CounterContext.instance().markLocalToBeCleared(CounterContext.instance().createLocal(1));
+        assertTrue(CounterContext.instance().shouldClearLocal(marked, ByteBufferAccessor.instance));
+        PartitionUpdate update = new RowUpdateBuilder(command.metadata(), 1L, 0).add("c", marked).buildUpdate();
+        new Mutation(update).apply();
+
+        ReadResponse response = materializeLocalResponse(command);
+        ByteBuffer digest = response.digest(command);
+
+        getColumnFamilyStore(keyspace, table).forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
+
+        Cell<?> cell = onlyCell(response, command);
+        assertFalse(CounterContext.instance().shouldClearLocal(cell.buffer(), ByteBufferAccessor.instance));
+        assertEquals(1L, CounterContext.instance().total(cell));
+        assertEquals(digest, response.digest(command));
+    }
+
+    private static void assertOffHeapObjectsIfRequested()
+    {
+        if (TEST_LOCAL_RESPONSE_REQUIRE_OFFHEAP.getBoolean())
+            assertEquals(Config.MemtableAllocationType.offheap_objects, DatabaseDescriptor.getMemtableAllocationType());
+    }
+
+    private static ReadResponse materializeLocalResponse(SinglePartitionReadCommand command)
+    {
+        try (ReadExecutionController controller = command.executionController();
+             UnfilteredPartitionIterator source = command.executeLocally(controller))
+        {
+            return command.createResponseForLocalRead(source, controller.getRepairedDataInfo());
+        }
+    }
+
+    private static Cell<?> onlyCell(ReadResponse response, SinglePartitionReadCommand command)
+    {
+        try (UnfilteredPartitionIterator partitions = response.makeIterator(command))
+        {
+            assertTrue(partitions.hasNext());
+            try (UnfilteredRowIterator partition = partitions.next())
+            {
+                assertTrue(partition.hasNext());
+                Row row = (Row) partition.next();
+                for (Cell<?> cell : row.cells())
+                    return cell;
+            }
+        }
+        throw new AssertionError("Expected a cell");
     }
 
     private void populate(String keyspace, String table) throws Throwable
