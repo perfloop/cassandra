@@ -89,7 +89,6 @@ import org.apache.cassandra.db.partitions.FilteredPartition;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.PartitionIterators;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
-import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.db.view.ViewUtils;
 import org.apache.cassandra.dht.AbstractBounds;
@@ -2750,10 +2749,9 @@ public class StorageProxy implements StorageProxyMBean
                 command.setMonitoringTime(requestTime.startedAtNanos(), false, deadline - requestTime.startedAtNanos(), DatabaseDescriptor.getSlowQueryTimeout(NANOSECONDS));
 
                 ReadResponse response;
-                try (ReadExecutionController controller = command.executionController(trackRepairedStatus);
-                     UnfilteredPartitionIterator iterator = command.executeLocally(controller))
+                try (ReadExecutionController controller = command.executionController(trackRepairedStatus))
                 {
-                    response = command.createResponseForLocalRead(iterator, controller.getRepairedDataInfo());
+                    response = command.executeLocallyAndCreateResponse(controller);
                 }
                 catch (RejectException e)
                 {

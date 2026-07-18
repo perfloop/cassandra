@@ -28,7 +28,9 @@ import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.NativeDecoratedKey;
 import org.apache.cassandra.db.ReadExecutionController;
 import org.apache.cassandra.db.ReadResponse;
 import org.apache.cassandra.db.RowUpdateBuilder;
@@ -39,8 +41,10 @@ import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.NativeCell;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.transport.Dispatcher;
@@ -80,11 +84,12 @@ public class CoordinatorLocalReadResponseTest extends CQLTester
     {
         assertOffHeapObjectsIfRequested();
         String keyspace = createKeyspace("CREATE KEYSPACE %s WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 } AND durable_writes = false");
-        String table = createTable(keyspace, "CREATE TABLE %s (pk int PRIMARY KEY, v text)");
+        String table = createTable(keyspace, "CREATE TABLE %s (pk int PRIMARY KEY, v text) WITH memtable = 'skiplist'");
         executeInternal("INSERT INTO " + keyspace + '.' + table + " (pk, v) VALUES (0, 'before-flush')");
 
         SinglePartitionReadCommand command = parseReadCommandGroup("SELECT v FROM " + keyspace + '.' + table + " WHERE pk = 0").queries.get(0);
         ReadResponse response = materializeLocalResponse(command);
+        assertResponseDoesNotRetainNativeObjects(response, command);
         ByteBuffer digest = response.digest(command);
 
         getColumnFamilyStore(keyspace, table).forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
@@ -94,11 +99,31 @@ public class CoordinatorLocalReadResponseTest extends CQLTester
     }
 
     @Test
+    public void retainsStaticRowsAndRangeTombstonesAfterSourceReleaseAndMemtableFlush() throws Throwable
+    {
+        assertOffHeapObjectsIfRequested();
+        String keyspace = createKeyspace("CREATE KEYSPACE %s WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 } AND durable_writes = false");
+        String table = createTable(keyspace, "CREATE TABLE %s (pk int, ck int, s text static, v text, PRIMARY KEY (pk, ck)) WITH memtable = 'skiplist'");
+        executeInternal("INSERT INTO " + keyspace + '.' + table + " (pk, s) VALUES (0, 'static')");
+        executeInternal("INSERT INTO " + keyspace + '.' + table + " (pk, ck, v) VALUES (0, 0, 'row')");
+        executeInternal("DELETE FROM " + keyspace + '.' + table + " WHERE pk = 0 AND ck >= 1 AND ck <= 2");
+
+        SinglePartitionReadCommand command = parseReadCommandGroup("SELECT s, ck, v FROM " + keyspace + '.' + table + " WHERE pk = 0").queries.get(0);
+        ReadResponse response = materializeLocalResponse(command);
+        ByteBuffer digest = response.digest(command);
+
+        getColumnFamilyStore(keyspace, table).forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
+
+        assertStaticRowAndRangeTombstones(response, command);
+        assertEquals(digest, response.digest(command));
+    }
+
+    @Test
     public void clearsMarkedNativeCounterContextBeforeSourceRelease() throws Throwable
     {
         assertOffHeapObjectsIfRequested();
         String keyspace = createKeyspace("CREATE KEYSPACE %s WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 } AND durable_writes = false");
-        String table = createTable(keyspace, "CREATE TABLE %s (pk int PRIMARY KEY, c counter)");
+        String table = createTable(keyspace, "CREATE TABLE %s (pk int PRIMARY KEY, c counter) WITH memtable = 'skiplist'");
         SinglePartitionReadCommand command = parseReadCommandGroup("SELECT c FROM " + keyspace + '.' + table + " WHERE pk = 0").queries.get(0);
         ByteBuffer marked = CounterContext.instance().markLocalToBeCleared(CounterContext.instance().createLocal(1));
         assertTrue(CounterContext.instance().shouldClearLocal(marked, ByteBufferAccessor.instance));
@@ -106,6 +131,7 @@ public class CoordinatorLocalReadResponseTest extends CQLTester
         new Mutation(update).apply();
 
         ReadResponse response = materializeLocalResponse(command);
+        assertResponseDoesNotRetainNativeObjects(response, command);
         ByteBuffer digest = response.digest(command);
 
         getColumnFamilyStore(keyspace, table).forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
@@ -124,11 +150,69 @@ public class CoordinatorLocalReadResponseTest extends CQLTester
 
     private static ReadResponse materializeLocalResponse(SinglePartitionReadCommand command)
     {
-        try (ReadExecutionController controller = command.executionController();
-             UnfilteredPartitionIterator source = command.executeLocally(controller))
+        try (ReadExecutionController controller = command.executionController())
         {
-            return command.createResponseForLocalRead(source, controller.getRepairedDataInfo());
+            return command.executeLocallyAndCreateResponse(controller);
         }
+    }
+
+    private static void assertResponseDoesNotRetainNativeObjects(ReadResponse response, SinglePartitionReadCommand command)
+    {
+        assertFalse(onlyPartitionKey(response, command) instanceof NativeDecoratedKey);
+        assertFalse(onlyCell(response, command) instanceof NativeCell);
+    }
+
+    private static DecoratedKey onlyPartitionKey(ReadResponse response, SinglePartitionReadCommand command)
+    {
+        try (UnfilteredPartitionIterator partitions = response.makeIterator(command))
+        {
+            assertTrue(partitions.hasNext());
+            try (UnfilteredRowIterator partition = partitions.next())
+            {
+                return partition.partitionKey();
+            }
+        }
+    }
+
+    private static void assertStaticRowAndRangeTombstones(ReadResponse response, SinglePartitionReadCommand command)
+    {
+        try (UnfilteredPartitionIterator partitions = response.makeIterator(command))
+        {
+            assertTrue(partitions.hasNext());
+            try (UnfilteredRowIterator partition = partitions.next())
+            {
+                Cell<?> staticCell = onlyCell(partition.staticRow());
+                assertFalse(staticCell instanceof NativeCell);
+                assertEquals(ByteBufferUtil.bytes("static"), staticCell.buffer());
+
+                boolean sawRow = false;
+                boolean sawRangeTombstone = false;
+                while (partition.hasNext())
+                {
+                    Unfiltered unfiltered = partition.next();
+                    if (unfiltered.isRow())
+                    {
+                        Cell<?> cell = onlyCell((Row) unfiltered);
+                        assertFalse(cell instanceof NativeCell);
+                        assertEquals(ByteBufferUtil.bytes("row"), cell.buffer());
+                        sawRow = true;
+                    }
+                    else
+                    {
+                        sawRangeTombstone = true;
+                    }
+                }
+                assertTrue(sawRow);
+                assertTrue(sawRangeTombstone);
+            }
+        }
+    }
+
+    private static Cell<?> onlyCell(Row row)
+    {
+        for (Cell<?> cell : row.cells())
+            return cell;
+        throw new AssertionError("Expected a cell");
     }
 
     private static Cell<?> onlyCell(ReadResponse response, SinglePartitionReadCommand command)

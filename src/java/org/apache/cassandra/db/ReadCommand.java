@@ -440,15 +440,6 @@ public abstract class ReadCommand extends AbstractReadQuery
         return createResponse(iterator, rdi, false, false);
     }
 
-    /**
-     * Creates a response from this command's ordinary local-read path. Local reads already return heap-owned values,
-     * so materialization can retain their rows without a second value copy.
-     */
-    public ReadResponse createResponseForLocalRead(UnfilteredPartitionIterator iterator, RepairedDataInfo rdi)
-    {
-        return createResponse(iterator, rdi, false, true);
-    }
-
     // Remote replicas send their response over the wire rather than replaying it on this coordinator.
     ReadResponse createResponseForRemote(UnfilteredPartitionIterator iterator, RepairedDataInfo rdi)
     {
@@ -614,6 +605,17 @@ public abstract class ReadCommand extends AbstractReadQuery
         finally
         {
             COMMAND.set(null);
+        }
+    }
+
+    /**
+     * Executes and materializes an ordinary local read while its source iterator is still open.
+     */
+    public ReadResponse executeLocallyAndCreateResponse(ReadExecutionController executionController)
+    {
+        try (UnfilteredPartitionIterator iterator = executeLocally(executionController))
+        {
+            return createResponse(iterator, executionController.getRepairedDataInfo(), false, true);
         }
     }
 
