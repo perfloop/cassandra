@@ -51,7 +51,7 @@ import org.apache.cassandra.utils.memory.ByteBufferCloner;
  */
 public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurableMemory
 {
-    private static final long EMPTY_SIZE = ObjectSizes.measure(new RangeTombstoneList(null, 0));
+    private static long EMPTY_SIZE = ObjectSizes.measure(new RangeTombstoneList(null, 0));
     private static final int PAGE_SHIFT = 6;
     private static final int PAGE_SIZE = 1 << PAGE_SHIFT;
     private static final int PAGE_MASK = PAGE_SIZE - 1;
@@ -136,6 +136,16 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     public RangeTombstoneList copy()
     {
+        if (pages == null)
+        {
+            return new RangeTombstoneList(comparator,
+                                          Arrays.copyOf(starts, size),
+                                          Arrays.copyOf(ends, size),
+                                          Arrays.copyOf(markedAts, size),
+                                          Arrays.copyOf(delTimesUnsignedIntegers, size),
+                                          boundaryHeapSize, size);
+        }
+
         RangeTombstoneList copy = new RangeTombstoneList(comparator, size);
         copyArrays(this, copy);
         return copy;
@@ -266,7 +276,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
             return;
         }
 
-        int c = comparator.compare(ends[size - 1], start);
+        int c = comparator.compare(ends[size-1], start);
 
         // Fast path if we add in sorted order
         if (c <= 0)
@@ -277,7 +287,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         {
             // Note: insertFrom expect i to be the insertion point in term of interval ends
             int pos = Arrays.binarySearch(ends, 0, size, start, comparator);
-            insertFrom((pos >= 0 ? pos + 1 : -pos - 1), start, end, markedAt, delTimeUnsignedInteger);
+            insertFrom((pos >= 0 ? pos+1 : -pos-1), start, end, markedAt, delTimeUnsignedInteger);
         }
         boundaryHeapSize += start.unsharedHeapSize() + end.unsharedHeapSize();
     }
@@ -346,7 +356,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
                     i++;
                 }
             }
-            // Adds the remaining ones from tombstones if any (note that addInternal will increment size if relevant).
+            // Addds the remaining ones from tombstones if any (note that addInternal will increment size if relevant).
             for (; j < tombstones.size; j++)
                 addInternal(size, tombstones.startAt(j), tombstones.endAt(j), tombstones.markedAtAt(j), tombstones.deletionTimeAt(j));
         }
@@ -398,6 +408,12 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         if (isEmpty())
             return -1;
 
+        if (pages == null)
+            return searchFlat(name, startIdx, endIdx);
+
+        if (trailingStart == null)
+            return searchPaged(name, startIdx, endIdx);
+
         int indexedEnd = Math.min(endIdx, starts.length);
         int pos = startIdx < indexedEnd
                   ? Arrays.binarySearch(starts, startIdx, indexedEnd, name, comparator)
@@ -421,6 +437,42 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
         // We potentially intersect the range before our "insertion point"
         int idx = insertionPoint - 1;
+        if (idx < 0)
+            return -1;
+
+        return comparator.compare(name, endAt(idx)) < 0 ? idx : -idx - 2;
+    }
+
+    private int searchFlat(ClusteringPrefix<?> name, int startIdx, int endIdx)
+    {
+        int pos = Arrays.binarySearch(starts, startIdx, endIdx, name, comparator);
+        if (pos >= 0)
+        {
+            // Equality only happens for bounds (as used by forward/reverseIterator), and bounds are equal only if they
+            // are the same or complementary, in either case the bound itself is not part of the range.
+            return -pos - 1;
+        }
+
+        // We potentially intersect the range before our "insertion point"
+        int idx = -pos - 2;
+        if (idx < 0)
+            return -1;
+
+        return comparator.compare(name, ends[idx]) < 0 ? idx : -idx - 2;
+    }
+
+    private int searchPaged(ClusteringPrefix<?> name, int startIdx, int endIdx)
+    {
+        int pos = Arrays.binarySearch(starts, startIdx, endIdx, name, comparator);
+        if (pos >= 0)
+        {
+            // Equality only happens for bounds (as used by forward/reverseIterator), and bounds are equal only if they
+            // are the same or complementary, in either case the bound itself is not part of the range.
+            return -pos - 1;
+        }
+
+        // We potentially intersect the range before our "insertion point"
+        int idx = -pos - 2;
         if (idx < 0)
             return -1;
 
@@ -567,14 +619,14 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
     private Iterator<RangeTombstone> forwardIterator(final Slice slice)
     {
         int startIdx = slice.start().isBottom() ? 0 : searchInternal(slice.start(), 0, size);
-        final int start = startIdx < 0 ? -startIdx - 1 : startIdx;
+        final int start = startIdx < 0 ? -startIdx-1 : startIdx;
 
         if (start >= size)
             return Collections.emptyIterator();
 
         int finishIdx = slice.end().isTop() ? size - 1 : searchInternal(slice.end(), start, size);
         // if stopIdx is the first range after 'slice.end()' we care only until the previous range
-        final int finish = finishIdx < 0 ? -finishIdx - 2 : finishIdx;
+        final int finish = finishIdx < 0 ? -finishIdx-2 : finishIdx;
 
         if (start > finish)
             return Collections.emptyIterator();
@@ -645,14 +697,14 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
     {
         int startIdx = slice.end().isTop() ? size - 1 : searchInternal(slice.end(), 0, size);
         // if startIdx is the first range after 'slice.end()' we care only until the previous range
-        final int start = startIdx < 0 ? -startIdx - 2 : startIdx;
+        final int start = startIdx < 0 ? -startIdx-2 : startIdx;
 
         if (start < 0)
             return Collections.emptyIterator();
 
         int finishIdx = slice.start().isBottom() ? 0 : searchInternal(slice.start(), 0, start + 1);  // include same as finish
         // if stopIdx is the first range after 'slice.end()' we care only until the previous range
-        final int finish = finishIdx < 0 ? -finishIdx - 1 : finishIdx;
+        final int finish = finishIdx < 0 ? -finishIdx-1 : finishIdx;
 
         if (start < finish)
             return Collections.emptyIterator();
@@ -691,9 +743,9 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
     @Override
     public boolean equals(Object o)
     {
-        if (!(o instanceof RangeTombstoneList))
+        if(!(o instanceof RangeTombstoneList))
             return false;
-        RangeTombstoneList that = (RangeTombstoneList) o;
+        RangeTombstoneList that = (RangeTombstoneList)o;
         if (size != that.size)
             return false;
 
@@ -719,7 +771,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         {
             result += startAt(i).hashCode() + endAt(i).hashCode();
             long markedAt = markedAtAt(i);
-            result += (int) (markedAt ^ (markedAt >>> 32));
+            result += (int)(markedAt ^ (markedAt >>> 32));
             result += deletionTimeAt(i);
         }
         return result;
@@ -777,15 +829,17 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         page.markedAts[offset] = markedAt;
         page.delTimesUnsignedIntegers[offset] = delTimeUnsignedInteger;
 
-        if (starts.length == size)
+        // Publish a complete starts index at full-page boundaries so searches do not need a trailing-bound case.
+        if (starts.length == size && ((size + 1) & PAGE_MASK) != 0)
         {
             trailingStart = start;
         }
         else
         {
-            assert starts.length == size - 1;
+            assert starts.length == size || starts.length == size - 1;
             starts = Arrays.copyOf(starts, size + 1);
-            starts[size - 1] = trailingStart;
+            if (trailingStart != null)
+                starts[size - 1] = trailingStart;
             starts[size] = start;
             trailingStart = null;
         }

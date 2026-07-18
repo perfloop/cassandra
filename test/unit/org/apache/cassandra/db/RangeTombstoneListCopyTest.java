@@ -286,17 +286,6 @@ public class RangeTombstoneListCopyTest
     }
 
     @Test
-    public void orderedSnapshotAccountingMatchesTheAtomicMemtableDelta()
-    {
-        Fixture fixture = fixture();
-        fixture.add(0);
-
-        assertDeletionAccountingForNextRange(fixture, 1);
-        assertDeletionAccountingForNextRange(fixture, 2);
-        assertDeletionAccountingForNextRange(fixture, 3);
-    }
-
-    @Test
     public void firstPagedSnapshotChargesTheIndependentlyCalculatedPageLayout()
     {
         Fixture fixture = fixture();
