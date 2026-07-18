@@ -445,6 +445,12 @@ public abstract class ReadCommand extends AbstractReadQuery
         return createResponse(iterator, rdi, true);
     }
 
+    @VisibleForTesting
+    public ReadResponse createLocalResponse(UnfilteredPartitionIterator iterator)
+    {
+        return createLocalResponse(iterator, RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO);
+    }
+
     private ReadResponse createResponse(UnfilteredPartitionIterator iterator, RepairedDataInfo rdi, boolean local)
     {
         // validate that the sequence of RT markers is correct: open is followed by close, deletion times for both

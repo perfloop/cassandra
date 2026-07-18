@@ -67,27 +67,30 @@ public abstract class ReadResponse
 
     public static ReadResponse createDataResponse(UnfilteredPartitionIterator data, ReadCommand command, RepairedDataInfo rdi)
     {
-        return new SerializedDataResponse(data, command, rdi);
+        return new DataResponse(LocalDataResponse.build(data, command.columnFilter()),
+                                rdi.getDigest(),
+                                rdi.isConclusive(),
+                                MessagingService.current_version,
+                                DeserializationHelper.Flag.LOCAL);
     }
 
     public static ReadResponse createDataResponse(UnfilteredPartitionIterator data, ReadCommand command)
     {
-        return new SerializedDataResponse(data, command, NO_OP_REPAIRED_DATA_INFO);
+        return createDataResponse(data, command, NO_OP_REPAIRED_DATA_INFO);
     }
 
-    public static ReadResponse createLocalDataResponse(UnfilteredPartitionIterator data, ReadCommand command, RepairedDataInfo rdi)
+    static ReadResponse createLocalDataResponse(UnfilteredPartitionIterator data, ReadCommand command, RepairedDataInfo rdi)
     {
         return new LocalDataResponse(data, command, rdi);
     }
 
-    public static ReadResponse createLocalDataResponse(UnfilteredPartitionIterator data, ReadCommand command)
-    {
-        return new LocalDataResponse(data, command, NO_OP_REPAIRED_DATA_INFO);
-    }
-
     public static ReadResponse createSimpleDataResponse(UnfilteredPartitionIterator data, ColumnFilter selection)
     {
-        return new LocalDataResponse(data, selection);
+        return new DataResponse(LocalDataResponse.build(data, selection),
+                                null,
+                                false,
+                                MessagingService.current_version,
+                                DeserializationHelper.Flag.LOCAL);
     }
 
     @VisibleForTesting
@@ -189,7 +192,11 @@ public abstract class ReadResponse
             // so we effectively deserialize and then reserialize in order to apply the limits
             // Wasteful, but better than sending it to the coordinator to do it
             UnfilteredPartitionIterator filtered = command.limits().filter(UnfilteredPartitionIterators.concat(iterators), 0, command.selectsFullPartition());
-            return new SerializedDataResponse(filtered, command, NO_OP_REPAIRED_DATA_INFO);
+            return new DataResponse(LocalDataResponse.build(filtered, command.columnFilter()),
+                                    ByteBufferUtil.EMPTY_BYTE_BUFFER,
+                                    true,
+                                    MessagingService.current_version,
+                                    DeserializationHelper.Flag.LOCAL);
         }
     }
 
@@ -246,18 +253,6 @@ public abstract class ReadResponse
         }
     }
 
-    // built on a replica that must serialize its response for a remote coordinator
-    private static class SerializedDataResponse extends DataResponse
-    {
-        private SerializedDataResponse(UnfilteredPartitionIterator iter, ReadCommand command, RepairedDataInfo rdi)
-        {
-            super(LocalDataResponse.build(iter, command.columnFilter()),
-                  rdi.getDigest(), rdi.isConclusive(),
-                  MessagingService.current_version,
-                  DeserializationHelper.Flag.LOCAL);
-        }
-    }
-
     // built on the coordinator when it is also the owning replica
     private static class LocalDataResponse extends DataResponse
     {
@@ -306,19 +301,6 @@ public abstract class ReadResponse
             this.selection = selection;
         }
 
-        private LocalDataResponse(UnfilteredPartitionIterator iter, ColumnFilter selection)
-        {
-            this(iter.metadata(), materialize(iter), selection);
-        }
-
-        private LocalDataResponse(TableMetadata metadata, List<LocalPartition> partitions, ColumnFilter selection)
-        {
-            super(ByteBufferUtil.EMPTY_BYTE_BUFFER, null, false, MessagingService.current_version, DeserializationHelper.Flag.LOCAL);
-            this.metadata = metadata;
-            this.partitions = partitions;
-            this.selection = selection;
-        }
-
         @Override
         public UnfilteredPartitionIterator makeIterator(ReadCommand command)
         {
@@ -335,12 +317,13 @@ public abstract class ReadResponse
 
         private static List<LocalPartition> materialize(UnfilteredPartitionIterator iter)
         {
+            ArenaCloner cloner = new ArenaCloner();
             List<LocalPartition> partitions = new ArrayList<>();
             while (iter.hasNext())
             {
                 try (UnfilteredRowIterator partition = iter.next())
                 {
-                    partitions.add(new LocalPartition(partition));
+                    partitions.add(new LocalPartition(partition, cloner));
                 }
             }
             return partitions;
@@ -398,9 +381,8 @@ public abstract class ReadResponse
             private final EncodingStats stats;
             private final List<Unfiltered> unfiltereds;
 
-            private LocalPartition(UnfilteredRowIterator partition)
+            private LocalPartition(UnfilteredRowIterator partition, ByteBufferCloner cloner)
             {
-                ByteBufferCloner cloner = new ArenaCloner();
                 DecoratedKey sourceKey = partition.partitionKey();
                 key = new BufferDecoratedKey(sourceKey.getToken(), cloner.clone(sourceKey.getKey()));
                 partitionDeletion = partition.partitionLevelDeletion();
@@ -421,11 +403,13 @@ public abstract class ReadResponse
 
             private UnfilteredRowIterator iterator(TableMetadata metadata)
             {
+                ColumnFilter droppedColumnFilter = metadata.droppedColumns.isEmpty() ? null : ColumnFilter.allEver(metadata);
+                Row iteratorStaticRow = filterDroppedColumns(staticRow, metadata, droppedColumnFilter);
                 return new AbstractUnfilteredRowIterator(metadata,
                                                          key,
                                                          partitionDeletion,
                                                          columns,
-                                                         staticRow,
+                                                         iteratorStaticRow,
                                                          isReverseOrder,
                                                          stats)
                 {
@@ -434,9 +418,20 @@ public abstract class ReadResponse
                     @Override
                     protected Unfiltered computeNext()
                     {
-                        return iterator.hasNext() ? iterator.next() : endOfData();
+                        if (!iterator.hasNext())
+                            return endOfData();
+
+                        Unfiltered unfiltered = iterator.next();
+                        return unfiltered.isRow()
+                               ? filterDroppedColumns((Row) unfiltered, metadata, droppedColumnFilter)
+                               : unfiltered;
                     }
                 };
+            }
+
+            private static Row filterDroppedColumns(Row row, TableMetadata metadata, ColumnFilter filter)
+            {
+                return filter == null ? row : row.filter(filter, metadata);
             }
         }
 
@@ -445,7 +440,6 @@ public abstract class ReadResponse
             private static final int INITIAL_CHUNK_SIZE = 1024;
 
             private ByteBuffer buffer;
-            private int nextChunkSize = INITIAL_CHUNK_SIZE;
 
             @Override
             public boolean isContextAwareCloningSupported()
@@ -458,9 +452,7 @@ public abstract class ReadResponse
             {
                 if (buffer == null || buffer.remaining() < size)
                 {
-                    int capacity = Math.max(size, nextChunkSize);
-                    buffer = ByteBuffer.allocate(capacity);
-                    nextChunkSize = capacity > Integer.MAX_VALUE / 2 ? Integer.MAX_VALUE : capacity * 2;
+                    buffer = ByteBuffer.allocate(Math.max(size, INITIAL_CHUNK_SIZE));
                 }
 
                 ByteBuffer slice = buffer.slice();
@@ -476,7 +468,9 @@ public abstract class ReadResponse
             private final Iterator<LocalPartition> partitions;
             private final boolean clearLocalCounterContext;
 
-            private LocalPartitionIterator(TableMetadata metadata, List<LocalPartition> partitions, boolean clearLocalCounterContext)
+            private LocalPartitionIterator(TableMetadata metadata,
+                                           List<LocalPartition> partitions,
+                                           boolean clearLocalCounterContext)
             {
                 this.metadata = metadata;
                 this.partitions = partitions.iterator();
@@ -516,7 +510,7 @@ public abstract class ReadResponse
         }
     }
 
-    static abstract class DataResponse extends ReadResponse
+    static class DataResponse extends ReadResponse
     {
         // TODO: can the digest be calculated over the raw bytes now?
         // The response, serialized in the current messaging version

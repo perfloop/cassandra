@@ -19,21 +19,13 @@ package org.apache.cassandra.test.microbench;
 
 import java.nio.ByteBuffer;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.TimeUnit;
 
 import org.openjdk.jmh.annotations.Benchmark;
-import org.openjdk.jmh.annotations.BenchmarkMode;
-import org.openjdk.jmh.annotations.Fork;
 import org.openjdk.jmh.annotations.Level;
-import org.openjdk.jmh.annotations.Measurement;
-import org.openjdk.jmh.annotations.Mode;
-import org.openjdk.jmh.annotations.OutputTimeUnit;
-import org.openjdk.jmh.annotations.Param;
 import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.Threads;
-import org.openjdk.jmh.annotations.Warmup;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.DecoratedKey;
@@ -53,23 +45,13 @@ import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.FBUtilities;
 
-@BenchmarkMode(Mode.AverageTime)
-@OutputTimeUnit(TimeUnit.NANOSECONDS)
-@Warmup(iterations = 5, time = 1)
-@Measurement(iterations = 1, time = 1)
-@Fork(value = 1)
 @Threads(1)
 @State(Scope.Benchmark)
 public class LocalReadResponseBench
 {
-    @Param({ "100" })
-    public int rowCount;
-
-    @Param({ "4" })
-    public int columnCount;
-
-    @Param({ "32" })
-    public int valueBytes;
+    private static final int ROW_COUNT = 100;
+    private static final int COLUMN_COUNT = 4;
+    private static final int VALUE_BYTES = 32;
 
     private ReadCommand command;
     private PartitionUpdate partition;
@@ -84,7 +66,7 @@ public class LocalReadResponseBench
                                                     .offline()
                                                     .addPartitionKeyColumn("pk", Int32Type.instance)
                                                     .addClusteringColumn("ck", Int32Type.instance);
-        for (int column = 0; column < columnCount; column++)
+        for (int column = 0; column < COLUMN_COUNT; column++)
             table.addRegularColumn("v" + column, UTF8Type.instance);
 
         TableMetadata metadata = table.partitioner(Murmur3Partitioner.instance).build();
@@ -92,12 +74,12 @@ public class LocalReadResponseBench
         command = SinglePartitionReadCommand.fullPartitionRead(metadata, FBUtilities.nowInSeconds(), key);
 
         PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(metadata, key).timestamp(1L);
-        for (int row = 0; row < rowCount; row++)
+        for (int row = 0; row < ROW_COUNT; row++)
         {
             Row.SimpleBuilder rowBuilder = builder.row(row);
-            for (int column = 0; column < columnCount; column++)
+            for (int column = 0; column < COLUMN_COUNT; column++)
             {
-                byte[] value = new byte[valueBytes];
+                byte[] value = new byte[VALUE_BYTES];
                 ThreadLocalRandom.current().nextBytes(value);
                 rowBuilder.add("v" + column, ByteBuffer.wrap(value));
             }
@@ -109,7 +91,7 @@ public class LocalReadResponseBench
     @Benchmark
     public long materializeAndConsume()
     {
-        ReadResponse response = ReadResponse.createLocalDataResponse(new SingletonUnfilteredPartitionIterator(partition.unfilteredIterator()), command);
+        ReadResponse response = command.createLocalResponse(new SingletonUnfilteredPartitionIterator(partition.unfilteredIterator()));
         return checksum(response.makeIterator(command));
     }
 
@@ -144,10 +126,10 @@ public class LocalReadResponseBench
             }
         }
 
-        if (rows != rowCount || cells != rowCount * columnCount || (expectedChecksum != 0 && checksum != expectedChecksum))
+        if (rows != ROW_COUNT || cells != ROW_COUNT * COLUMN_COUNT || (expectedChecksum != 0 && checksum != expectedChecksum))
             throw new AssertionError(String.format("expected rows=%d cells=%d checksum=%d but got rows=%d cells=%d checksum=%d",
-                                                   rowCount,
-                                                   rowCount * columnCount,
+                                                   ROW_COUNT,
+                                                   ROW_COUNT * COLUMN_COUNT,
                                                    expectedChecksum,
                                                    rows,
                                                    cells,

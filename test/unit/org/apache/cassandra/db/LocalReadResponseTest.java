@@ -26,6 +26,10 @@ import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.context.CounterContext;
+import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.ByteBufferAccessor;
 import org.apache.cassandra.db.marshal.CounterColumnType;
 import org.apache.cassandra.db.marshal.Int32Type;
@@ -41,14 +45,20 @@ import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.rows.WrappingUnfilteredRowIterator;
 import org.apache.cassandra.distributed.test.log.ClusterMetadataTestHelper;
+import org.apache.cassandra.dht.Bounds;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.service.reads.ReadCallback;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CounterId;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.exceptions.RequestFailure;
+import org.apache.cassandra.locator.InetAddressAndPort;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -79,7 +89,7 @@ public class LocalReadResponseTest
         ExhaustionTrackingPartitionIterator data = new ExhaustionTrackingPartitionIterator(new SingletonUnfilteredPartitionIterator(partition.unfilteredIterator()));
         ByteBuffer repairedDigest = ByteBufferUtil.bytes("repaired-data");
         ExhaustionTrackingRepairedDataInfo repairedDataInfo = new ExhaustionTrackingRepairedDataInfo(data, repairedDigest);
-        ReadResponse response = ReadResponse.createLocalDataResponse(data, command, repairedDataInfo);
+        ReadResponse response = command.createLocalResponse(data, repairedDataInfo);
 
         assertTrue("the response must finish consuming the local input before reading its repaired digest", data.rowsExhausted);
         assertTrue("the repaired digest must be read after the local input is materialized", repairedDataInfo.digestRead);
@@ -124,7 +134,7 @@ public class LocalReadResponseTest
         secondBuilder.row(5).add("v1", "second value");
         PartitionUpdate second = secondBuilder.build();
 
-        ReadResponse local = ReadResponse.createLocalDataResponse(partitions(first, second), command);
+        ReadResponse local = command.createLocalResponse(partitions(first, second), RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO);
         ReadResponse remote = ReadResponse.createRemoteDataResponse(partitions(first, second), ByteBufferUtil.EMPTY_BYTE_BUFFER, true, command, MessagingService.current_version);
         ByteBuffer expectedWireResponse = serialized(remote);
 
@@ -132,6 +142,73 @@ public class LocalReadResponseTest
         assertEquals(digest(remote, command), digest(local, command));
         assertEquals(digest(remote, command), digest(local, command));
         assertEquals(expectedWireResponse, serialized(local));
+    }
+
+    @Test
+    public void localResponsePreservesColumnFilterSerializationSemantics()
+    {
+        TableMetadata metadata = regularMetadata();
+        DecoratedKey key = key(metadata, 1);
+        ColumnFilter filter = ColumnFilter.selection(metadata,
+                                                     RegularAndStaticColumns.builder()
+                                                                            .add(metadata.getColumn(ByteBufferUtil.bytes("v0")))
+                                                                            .build(),
+                                                     false);
+        ReadCommand command = SinglePartitionReadCommand.create(metadata,
+                                                                 FBUtilities.nowInSeconds(),
+                                                                 key,
+                                                                 filter,
+                                                                 new ClusteringIndexSliceFilter(Slices.ALL, false));
+        PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(metadata, key).timestamp(1L);
+        builder.row(1).add("v0", "queried").add("v1", "fetched but not queried");
+        PartitionUpdate partition = builder.build();
+
+        ReadResponse serialized = ReadResponse.createDataResponse(new SingletonUnfilteredPartitionIterator(partition.unfilteredIterator()), command);
+        ReadResponse local = command.createLocalResponse(new SingletonUnfilteredPartitionIterator(partition.unfilteredIterator()), RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO);
+
+        try (UnfilteredPartitionIterator expectedPartitions = serialized.makeIterator(command);
+             UnfilteredPartitionIterator actualPartitions = local.makeIterator(command))
+        {
+            assertTrue(expectedPartitions.hasNext());
+            assertTrue(actualPartitions.hasNext());
+            try (UnfilteredRowIterator expected = expectedPartitions.next();
+                 UnfilteredRowIterator actual = actualPartitions.next())
+            {
+                assertEquals(expected.columns(), actual.columns());
+                assertEquals(expected.staticRow(), actual.staticRow());
+                assertTrue(expected.hasNext());
+                assertTrue(actual.hasNext());
+                Row expectedRow = (Row) expected.next();
+                Row actualRow = (Row) actual.next();
+                assertEquals(expectedRow, actualRow);
+                assertCellValue(actualRow, metadata, "v0", "queried".getBytes(StandardCharsets.UTF_8));
+                Cell<?> unqueried = actualRow.getCell(metadata.getColumn(ByteBufferUtil.bytes("v1")));
+                assertNotNull(unqueried);
+                assertEquals("fetched but not queried".getBytes(StandardCharsets.UTF_8).length, unqueried.valueSize());
+                assertFalse(expected.hasNext());
+                assertFalse(actual.hasNext());
+            }
+            assertFalse(expectedPartitions.hasNext());
+            assertFalse(actualPartitions.hasNext());
+        }
+        assertEquals(serialized.digest(command), local.digest(command));
+    }
+
+    @Test
+    public void localReadRunnableUsesTheDirectResponseRoute()
+    {
+        TableMetadata metadata = regularMetadata();
+        DecoratedKey key = key(metadata, 1);
+        PartitionUpdate partition = regularPartition(metadata, key);
+        LocalRunnableReadCommand command = new LocalRunnableReadCommand(metadata, key, partition);
+        CapturingReadCallback callback = new CapturingReadCallback(command);
+
+        new StorageProxy.LocalReadRunnable(command, callback, Dispatcher.RequestTime.forImmediateExecution()).run();
+
+        assertTrue(command.createLocalResponseCalled);
+        assertNotNull(callback.response);
+        assertEquals(checksum(new SingletonUnfilteredPartitionIterator(partition.unfilteredIterator())),
+                     checksum(callback.response.makeIterator(command)));
     }
 
     @Test
@@ -169,7 +246,7 @@ public class LocalReadResponseTest
                                                                         firstValue,
                                                                         secondValue,
                                                                         markerStart);
-        ReadResponse response = ReadResponse.createLocalDataResponse(new SingletonUnfilteredPartitionIterator(ephemeral), command);
+        ReadResponse response = command.createLocalResponse(new SingletonUnfilteredPartitionIterator(ephemeral), RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO);
 
         assertFalse(ByteBuffer.wrap(expectedKey).equals(ByteBuffer.wrap(keyValue)));
         assertFalse(ByteBuffer.wrap(expectedStatic).equals(ByteBuffer.wrap(staticValue)));
@@ -234,7 +311,7 @@ public class LocalReadResponseTest
         builder.row(1).add("count", markedCounterContext);
         PartitionUpdate partition = builder.build();
 
-        ReadResponse local = ReadResponse.createLocalDataResponse(new SingletonUnfilteredPartitionIterator(partition.unfilteredIterator()), command);
+        ReadResponse local = command.createLocalResponse(new SingletonUnfilteredPartitionIterator(partition.unfilteredIterator()), RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO);
         ReadResponse remote = ReadResponse.createRemoteDataResponse(new SingletonUnfilteredPartitionIterator(partition.unfilteredIterator()),
                                                                       null,
                                                                       false,
@@ -419,6 +496,74 @@ public class LocalReadResponseTest
                 assertNotNull(cell);
                 return cell.buffer().duplicate();
             }
+        }
+    }
+
+    private static class LocalRunnableReadCommand extends SinglePartitionReadCommand
+    {
+        private final PartitionUpdate result;
+        private boolean createLocalResponseCalled;
+
+        private LocalRunnableReadCommand(TableMetadata metadata, DecoratedKey key, PartitionUpdate result)
+        {
+            super(metadata.epoch,
+                  false,
+                  MessagingService.current_version,
+                  false,
+                  PotentialTxnConflicts.ALLOW,
+                  metadata,
+                  FBUtilities.nowInSeconds(),
+                  ColumnFilter.all(metadata),
+                  RowFilter.none(),
+                  DataLimits.NONE,
+                  key,
+                  new ClusteringIndexSliceFilter(Slices.ALL, false),
+                  null,
+                  false,
+                  new DataRange(new Bounds<>(key, key), new ClusteringIndexSliceFilter(Slices.ALL, false)));
+            this.result = result;
+        }
+
+        @Override
+        public UnfilteredPartitionIterator executeLocally(ReadExecutionController controller)
+        {
+            return new SingletonUnfilteredPartitionIterator(result.unfilteredIterator());
+        }
+
+        @Override
+        public ReadExecutionController executionController(boolean trackRepairedStatus)
+        {
+            return ReadExecutionController.empty();
+        }
+
+        @Override
+        public ReadResponse createLocalResponse(UnfilteredPartitionIterator iterator, RepairedDataInfo rdi)
+        {
+            createLocalResponseCalled = true;
+            return super.createLocalResponse(iterator, rdi);
+        }
+    }
+
+    @SuppressWarnings("rawtypes")
+    private static class CapturingReadCallback extends ReadCallback
+    {
+        private ReadResponse response;
+
+        private CapturingReadCallback(ReadCommand command)
+        {
+            super(null, command, null, Dispatcher.RequestTime.forImmediateExecution());
+        }
+
+        @Override
+        public void response(ReadResponse response)
+        {
+            this.response = response;
+        }
+
+        @Override
+        public void onFailure(InetAddressAndPort from, RequestFailure failure)
+        {
+            throw new AssertionError("local read failed: " + failure);
         }
     }
 
