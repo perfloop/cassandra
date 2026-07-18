@@ -71,8 +71,9 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     // Ordered memtable successors share immutable pages. Flat arrays remain the representation for general mutation.
     private Page[] pages;
-    private ClusteringBound<?>[] pageStarts;
-    private FlatView flatView;
+    private boolean pagesShared;
+    private int firstUnsharedPage;
+    private long unsharedPagedBoundaryHeapSize;
     private long pageAllocationOnHeap;
 
     private RangeTombstoneList(ClusteringComparator comparator,
@@ -95,9 +96,10 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
     private RangeTombstoneList(ClusteringComparator comparator,
                                Page[] pages,
-                               ClusteringBound<?>[] pageStarts,
-                               FlatView flatView,
+                               boolean pagesShared,
+                               int firstUnsharedPage,
                                long boundaryHeapSize,
+                               long unsharedPagedBoundaryHeapSize,
                                int size,
                                long pageAllocationOnHeap)
     {
@@ -107,9 +109,10 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         this.markedAts = null;
         this.delTimesUnsignedIntegers = null;
         this.pages = pages;
-        this.pageStarts = pageStarts;
-        this.flatView = flatView;
+        this.pagesShared = pagesShared;
+        this.firstUnsharedPage = firstUnsharedPage;
         this.boundaryHeapSize = boundaryHeapSize;
+        this.unsharedPagedBoundaryHeapSize = unsharedPagedBoundaryHeapSize;
         this.size = size;
         this.pageAllocationOnHeap = pageAllocationOnHeap;
     }
@@ -146,52 +149,61 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
                                           boundaryHeapSize, size);
         }
 
-        if (hasFlatView())
-        {
-            return new RangeTombstoneList(comparator,
-                                          Arrays.copyOf(flatView.starts, size),
-                                          Arrays.copyOf(flatView.ends, size),
-                                          Arrays.copyOf(flatView.markedAts, size),
-                                          Arrays.copyOf(flatView.delTimesUnsignedIntegers, size),
-                                          boundaryHeapSize, size);
-        }
-
         RangeTombstoneList copy = new RangeTombstoneList(comparator, size);
         copyArrays(this, copy);
         return copy;
     }
 
     /**
-     * Creates an immutable paged snapshot for an ordered memtable update. Only this path shares storage; every
-     * non-append mutation uses a flat copy so the public mutable-list contract remains unchanged.
+     * Creates an immutable paged snapshot for an ordered memtable update. A page is useful only after a full page can
+     * be retained unchanged by the next successor; before then the established flat copy has no unchanged prefix to
+     * share. Every non-append mutation uses a flat copy so the public mutable-list contract remains unchanged.
      */
     RangeTombstoneList copyForMemtable()
     {
-        if (pages != null)
-            return new RangeTombstoneList(comparator, pages, pageStarts, flatView, boundaryHeapSize, size, 0);
+        if (pages == null && size < PAGE_SIZE)
+            return copy();
+        return pagedCopyForMemtable();
+    }
 
-        Page[] copiedPages = pagesFromFlatArrays();
-        ClusteringBound<?>[] copiedPageStarts = pageStartsFromFlatArrays(copiedPages.length);
-        FlatView copiedFlatView = createsFlatView(size)
-                                  ? FlatView.copyOf(starts, ends, markedAts, delTimesUnsignedIntegers, size)
-                                  : null;
+    private RangeTombstoneList pagedCopyForMemtable()
+    {
+        if (pages == null)
+        {
+            Page[] copiedPages = pagesFromFlatArrays();
+            return new RangeTombstoneList(comparator,
+                                          copiedPages,
+                                          false,
+                                          0,
+                                          boundaryHeapSize,
+                                          0,
+                                          size,
+                                          pageStorageSize(copiedPages));
+        }
+
+        // Keep the source's ownership accounting intact. AtomicBTreePartition may discard this
+        // optimistic child after a failed CAS, so deriving a child must not change the retained
+        // memory reported by the published predecessor. The child reports only pages and bounds
+        // it detaches or appends; the predecessor remains the owner of the shared prefix.
         return new RangeTombstoneList(comparator,
-                                      copiedPages,
-                                      copiedPageStarts,
-                                      copiedFlatView,
+                                      pages,
+                                      true,
+                                      pages.length,
                                       boundaryHeapSize,
+                                      0,
                                       size,
-                                      pageStorageSize(copiedPages));
+                                      0);
     }
 
     RangeTombstoneList copyForMemtable(RangeTombstoneList update)
     {
         if (update == null || update.isEmpty())
-            return pages == null ? copy() : copyForMemtable();
+            return copy();
         if (!canAppend(update))
             return flatCopyForMemtable();
-
-        return copyForMemtable();
+        if (pages == null && size + update.size <= PAGE_SIZE)
+            return copy();
+        return pagedCopyForMemtable();
     }
 
     boolean canAppend(RangeTombstoneList update)
@@ -229,17 +241,10 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         return copy;
     }
 
-    private boolean hasFlatView()
-    {
-        return flatView != null && flatView.size == size;
-    }
-
     private ClusteringBound<?> startAt(int index)
     {
         if (pages == null)
             return starts[index];
-        if (hasFlatView())
-            return flatView.starts[index];
         return pages[index >>> PAGE_SHIFT].starts[index & PAGE_MASK];
     }
 
@@ -247,8 +252,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
     {
         if (pages == null)
             return ends[index];
-        if (hasFlatView())
-            return flatView.ends[index];
         return pages[index >>> PAGE_SHIFT].ends[index & PAGE_MASK];
     }
 
@@ -256,8 +259,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
     {
         if (pages == null)
             return markedAts[index];
-        if (hasFlatView())
-            return flatView.markedAts[index];
         return pages[index >>> PAGE_SHIFT].markedAts[index & PAGE_MASK];
     }
 
@@ -265,8 +266,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
     {
         if (pages == null)
             return delTimesUnsignedIntegers[index];
-        if (hasFlatView())
-            return flatView.delTimesUnsignedIntegers[index];
         return pages[index >>> PAGE_SHIFT].delTimesUnsignedIntegers[index & PAGE_MASK];
     }
 
@@ -418,8 +417,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
         if (pages == null)
             return DeletionTime.buildUnsafeWithUnsignedInteger(markedAts[idx], delTimesUnsignedIntegers[idx]);
-        if (hasFlatView())
-            return DeletionTime.buildUnsafeWithUnsignedInteger(flatView.markedAts[idx], flatView.delTimesUnsignedIntegers[idx]);
 
         Page page = pages[idx >>> PAGE_SHIFT];
         int offset = idx & PAGE_MASK;
@@ -445,8 +442,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
         if (pages == null)
             return searchFlat(name, starts, ends, startIdx, endIdx);
-        if (hasFlatView())
-            return searchFlat(name, flatView.starts, flatView.ends, startIdx, endIdx);
         return searchPaged(name, startIdx, endIdx);
     }
 
@@ -479,20 +474,33 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
 
         int firstPage = startIdx >>> PAGE_SHIFT;
         int lastPage = (endIdx - 1) >>> PAGE_SHIFT;
-        int pos = Arrays.binarySearch(pageStarts, firstPage, lastPage + 1, name, comparator);
-        int pageIndex;
-        if (pos >= 0)
+        int low = firstPage;
+        int high = lastPage;
+        int pageIndex = firstPage - 1;
+        while (low <= high)
         {
-            if (pos != firstPage || (startIdx & PAGE_MASK) == 0)
-                return -(pos << PAGE_SHIFT) - 1;
-            pageIndex = pos;
+            int mid = (low + high) >>> 1;
+            int comparison = comparator.compare(pages[mid].starts[0], name);
+            if (comparison < 0)
+            {
+                pageIndex = mid;
+                low = mid + 1;
+            }
+            else if (comparison > 0)
+            {
+                high = mid - 1;
+            }
+            else
+            {
+                if (mid != firstPage || (startIdx & PAGE_MASK) == 0)
+                    return -(mid << PAGE_SHIFT) - 1;
+                pageIndex = mid;
+                break;
+            }
         }
-        else
-        {
-            pageIndex = -pos - 2;
-            if (pageIndex < firstPage)
-                return -startIdx - 1;
-        }
+
+        if (pageIndex < firstPage)
+            return -startIdx - 1;
 
         Page page = pages[pageIndex];
         int pageFirst = pageIndex << PAGE_SHIFT;
@@ -561,9 +569,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         if (pages == null)
             return new RangeTombstone(Slice.make(starts[idx], ends[idx]),
                                       DeletionTime.buildUnsafeWithUnsignedInteger(markedAts[idx], delTimesUnsignedIntegers[idx]));
-        if (hasFlatView())
-            return new RangeTombstone(Slice.make(flatView.starts[idx], flatView.ends[idx]),
-                                      DeletionTime.buildUnsafeWithUnsignedInteger(flatView.markedAts[idx], flatView.delTimesUnsignedIntegers[idx]));
 
         return rangeTombstone(pages[idx >>> PAGE_SHIFT], idx & PAGE_MASK);
     }
@@ -579,9 +584,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         if (pages == null)
             return new RangeTombstone(Slice.make(newStart, ends[idx]),
                                       DeletionTime.buildUnsafeWithUnsignedInteger(markedAts[idx], delTimesUnsignedIntegers[idx]));
-        if (hasFlatView())
-            return new RangeTombstone(Slice.make(newStart, flatView.ends[idx]),
-                                      DeletionTime.buildUnsafeWithUnsignedInteger(flatView.markedAts[idx], flatView.delTimesUnsignedIntegers[idx]));
 
         Page page = pages[idx >>> PAGE_SHIFT];
         int offset = idx & PAGE_MASK;
@@ -594,9 +596,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         if (pages == null)
             return new RangeTombstone(Slice.make(starts[idx], newEnd),
                                       DeletionTime.buildUnsafeWithUnsignedInteger(markedAts[idx], delTimesUnsignedIntegers[idx]));
-        if (hasFlatView())
-            return new RangeTombstone(Slice.make(flatView.starts[idx], newEnd),
-                                      DeletionTime.buildUnsafeWithUnsignedInteger(flatView.markedAts[idx], flatView.delTimesUnsignedIntegers[idx]));
 
         Page page = pages[idx >>> PAGE_SHIFT];
         int offset = idx & PAGE_MASK;
@@ -609,9 +608,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         if (pages == null)
             return new RangeTombstone(Slice.make(newStart, newEnd),
                                       DeletionTime.buildUnsafeWithUnsignedInteger(markedAts[idx], delTimesUnsignedIntegers[idx]));
-        if (hasFlatView())
-            return new RangeTombstone(Slice.make(newStart, newEnd),
-                                      DeletionTime.buildUnsafeWithUnsignedInteger(flatView.markedAts[idx], flatView.delTimesUnsignedIntegers[idx]));
 
         Page page = pages[idx >>> PAGE_SHIFT];
         int offset = idx & PAGE_MASK;
@@ -684,10 +680,10 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
             return Iterators.<RangeTombstone>singletonIterator(rangeTombstoneWithNewBounds(start, s, e));
         }
 
-        if (pages == null || hasFlatView())
+        if (pages == null)
         {
-            final ClusteringBound<?>[] directStarts = pages == null ? starts : flatView.starts;
-            final ClusteringBound<?>[] directEnds = pages == null ? ends : flatView.ends;
+            final ClusteringBound<?>[] directStarts = starts;
+            final ClusteringBound<?>[] directEnds = ends;
             return new AbstractIterator<RangeTombstone>()
             {
                 private int idx = start;
@@ -831,13 +827,6 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
             System.arraycopy(src.markedAts, 0, dst.markedAts, 0, src.size);
             System.arraycopy(src.delTimesUnsignedIntegers, 0, dst.delTimesUnsignedIntegers, 0, src.size);
         }
-        else if (src.hasFlatView())
-        {
-            System.arraycopy(src.flatView.starts, 0, dst.starts, 0, src.size);
-            System.arraycopy(src.flatView.ends, 0, dst.ends, 0, src.size);
-            System.arraycopy(src.flatView.markedAts, 0, dst.markedAts, 0, src.size);
-            System.arraycopy(src.flatView.delTimesUnsignedIntegers, 0, dst.delTimesUnsignedIntegers, 0, src.size);
-        }
         else
         {
             for (int i = 0; i < src.size; i++)
@@ -869,40 +858,40 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         return copiedPages;
     }
 
-    private ClusteringBound<?>[] pageStartsFromFlatArrays(int pageCount)
-    {
-        ClusteringBound<?>[] copiedPageStarts = new ClusteringBound<?>[pageCount];
-        for (int pageIndex = 0; pageIndex < pageCount; pageIndex++)
-            copiedPageStarts[pageIndex] = starts[pageIndex << PAGE_SHIFT];
-        return copiedPageStarts;
-    }
-
     private void appendPaged(ClusteringBound<?> start, ClusteringBound<?> end, long markedAt, int delTimeUnsignedInteger)
     {
         Page[] oldPages = pages;
         int pageIndex = size >>> PAGE_SHIFT;
         int offset = size & PAGE_MASK;
         Page[] newPages = Arrays.copyOf(oldPages, offset == 0 ? oldPages.length + 1 : oldPages.length);
-        Page page = new Page(offset == 0 ? null : oldPages[pageIndex]);
-        newPages[pageIndex] = page;
+        Page page;
+        if (offset == 0)
+        {
+            page = new Page(null);
+            newPages[pageIndex] = page;
+        }
+        else
+        {
+            page = oldPages[pageIndex];
+            if (pageIndex < firstUnsharedPage)
+            {
+                page = new Page(page);
+                newPages[pageIndex] = page;
+            }
+        }
         page.starts[offset] = start;
         page.ends[offset] = end;
         page.markedAts[offset] = markedAt;
         page.delTimesUnsignedIntegers[offset] = delTimeUnsignedInteger;
 
-        ClusteringBound<?>[] newPageStarts = pageStarts;
-        if (offset == 0)
-        {
-            newPageStarts = Arrays.copyOf(pageStarts, pageIndex + 1);
-            newPageStarts[pageIndex] = start;
-        }
-
         pageAllocationOnHeap += pageStorageSize(newPages) - pageStorageSize(oldPages);
         pages = newPages;
-        pageStarts = newPageStarts;
+        pagesShared = false;
+        firstUnsharedPage = Math.min(firstUnsharedPage, pageIndex);
         size++;
-        flatView = createsFlatView(size) ? FlatView.copyOf(pages, size) : null;
-        boundaryHeapSize += start.unsharedHeapSize() + end.unsharedHeapSize();
+        long boundarySize = start.unsharedHeapSize() + end.unsharedHeapSize();
+        boundaryHeapSize += boundarySize;
+        unsharedPagedBoundaryHeapSize += boundarySize;
     }
 
     private void appendAllPaged(RangeTombstoneList tombstones)
@@ -926,7 +915,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
             else
             {
                 page = newPages[pageIndex];
-                if (pageIndex < oldPages.length && page == oldPages[pageIndex])
+                if (pageIndex < oldPages.length && page == oldPages[pageIndex] && pageIndex < firstUnsharedPage)
                 {
                     page = new Page(page);
                     newPages[pageIndex] = page;
@@ -937,29 +926,16 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
             page.ends[offset] = tombstones.endAt(i);
             page.markedAts[offset] = tombstones.markedAtAt(i);
             page.delTimesUnsignedIntegers[offset] = tombstones.deletionTimeAt(i);
-            boundaryHeapSize += page.starts[offset].unsharedHeapSize() + page.ends[offset].unsharedHeapSize();
-        }
-
-        ClusteringBound<?>[] newPageStarts = pageStarts;
-        if (newPageCount > oldPages.length)
-        {
-            newPageStarts = Arrays.copyOf(pageStarts, newPageCount);
-            for (int pageIndex = oldPages.length; pageIndex < newPageCount; pageIndex++)
-                newPageStarts[pageIndex] = newPages[pageIndex].starts[0];
+            long boundarySize = page.starts[offset].unsharedHeapSize() + page.ends[offset].unsharedHeapSize();
+            boundaryHeapSize += boundarySize;
+            unsharedPagedBoundaryHeapSize += boundarySize;
         }
 
         pageAllocationOnHeap += pageStorageSize(newPages) - pageStorageSize(oldPages);
         pages = newPages;
-        pageStarts = newPageStarts;
+        pagesShared = false;
+        firstUnsharedPage = Math.min(firstUnsharedPage, oldSize >>> PAGE_SHIFT);
         size = newSize;
-        flatView = createsFlatView(size) ? FlatView.copyOf(pages, size) : null;
-    }
-
-    // Direct views are retained at geometric checkpoints: rebuilding one for every append would reintroduce
-    // quadratic copying, while checkpoint views cost O(size) over an ordered append chain.
-    private static boolean createsFlatView(int size)
-    {
-        return size >= PAGE_SIZE && (size & (size - 1)) == 0;
     }
 
     private void materializeForMutation()
@@ -968,30 +944,22 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
             return;
 
         Page[] oldPages = pages;
-        if (hasFlatView())
+        unsharedPagedBoundaryHeapSize = 0;
+        starts = new ClusteringBound<?>[size];
+        ends = new ClusteringBound<?>[size];
+        markedAts = new long[size];
+        delTimesUnsignedIntegers = new int[size];
+        for (int i = 0; i < size; i++)
         {
-            starts = Arrays.copyOf(flatView.starts, size);
-            ends = Arrays.copyOf(flatView.ends, size);
-            markedAts = Arrays.copyOf(flatView.markedAts, size);
-            delTimesUnsignedIntegers = Arrays.copyOf(flatView.delTimesUnsignedIntegers, size);
-        }
-        else
-        {
-            starts = new ClusteringBound<?>[size];
-            ends = new ClusteringBound<?>[size];
-            markedAts = new long[size];
-            delTimesUnsignedIntegers = new int[size];
-            for (int i = 0; i < size; i++)
-            {
-                starts[i] = startAt(i);
-                ends[i] = endAt(i);
-                markedAts[i] = markedAtAt(i);
-                delTimesUnsignedIntegers[i] = deletionTimeAt(i);
-            }
+            starts[i] = startAt(i);
+            ends[i] = endAt(i);
+            markedAts[i] = markedAtAt(i);
+            delTimesUnsignedIntegers[i] = deletionTimeAt(i);
         }
         pages = null;
-        pageStarts = null;
-        flatView = null;
+        pagesShared = false;
+        firstUnsharedPage = 0;
+        unsharedPagedBoundaryHeapSize = 0;
         pageAllocationOnHeap -= pageStorageSize(oldPages);
     }
 
@@ -999,7 +967,17 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
     {
         long size = ObjectSizes.sizeOfArray(pages);
         for (Page page : pages)
-            size += page.unsharedHeapSize();
+            size += page.storageSize();
+        return size;
+    }
+
+    private long unsharedPagedHeapSize()
+    {
+        long size = EMPTY_SIZE + unsharedPagedBoundaryHeapSize;
+        if (!pagesShared)
+            size += ObjectSizes.sizeOfArray(pages);
+        for (int i = firstUnsharedPage; i < pages.length; i++)
+            size += pages[i].storageSize();
         return size;
     }
 
@@ -1008,10 +986,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
         if (pages == null)
             return unsharedHeapSize();
 
-        return EMPTY_SIZE
-             + boundaryHeapSize
-             + ObjectSizes.sizeOfArray(pageStarts)
-             + (flatView == null ? 0 : flatView.unsharedHeapSize());
+        return EMPTY_SIZE + boundaryHeapSize;
     }
 
     long pageAllocationOnHeap()
@@ -1049,83 +1024,9 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
             }
         }
 
-        private long unsharedHeapSize()
+        private long storageSize()
         {
             return PAGE_SIZE_ON_HEAP
-                 + ObjectSizes.sizeOfArray(starts)
-                 + ObjectSizes.sizeOfArray(ends)
-                 + ObjectSizes.sizeOfArray(markedAts)
-                 + ObjectSizes.sizeOfArray(delTimesUnsignedIntegers);
-        }
-    }
-
-    private static final class FlatView
-    {
-        private static final long EMPTY_SIZE = ObjectSizes.measure(new FlatView());
-
-        private final ClusteringBound<?>[] starts;
-        private final ClusteringBound<?>[] ends;
-        private final long[] markedAts;
-        private final int[] delTimesUnsignedIntegers;
-        private final int size;
-
-        private FlatView()
-        {
-            starts = null;
-            ends = null;
-            markedAts = null;
-            delTimesUnsignedIntegers = null;
-            size = 0;
-        }
-
-        private FlatView(ClusteringBound<?>[] starts,
-                         ClusteringBound<?>[] ends,
-                         long[] markedAts,
-                         int[] delTimesUnsignedIntegers,
-                         int size)
-        {
-            this.starts = starts;
-            this.ends = ends;
-            this.markedAts = markedAts;
-            this.delTimesUnsignedIntegers = delTimesUnsignedIntegers;
-            this.size = size;
-        }
-
-        private static FlatView copyOf(ClusteringBound<?>[] starts,
-                                       ClusteringBound<?>[] ends,
-                                       long[] markedAts,
-                                       int[] delTimesUnsignedIntegers,
-                                       int size)
-        {
-            return new FlatView(Arrays.copyOf(starts, size),
-                                Arrays.copyOf(ends, size),
-                                Arrays.copyOf(markedAts, size),
-                                Arrays.copyOf(delTimesUnsignedIntegers, size),
-                                size);
-        }
-
-        private static FlatView copyOf(Page[] pages, int size)
-        {
-            ClusteringBound<?>[] starts = new ClusteringBound<?>[size];
-            ClusteringBound<?>[] ends = new ClusteringBound<?>[size];
-            long[] markedAts = new long[size];
-            int[] delTimesUnsignedIntegers = new int[size];
-            for (int pageIndex = 0; pageIndex < pages.length; pageIndex++)
-            {
-                Page page = pages[pageIndex];
-                int first = pageIndex << PAGE_SHIFT;
-                int count = Math.min(PAGE_SIZE, size - first);
-                System.arraycopy(page.starts, 0, starts, first, count);
-                System.arraycopy(page.ends, 0, ends, first, count);
-                System.arraycopy(page.markedAts, 0, markedAts, first, count);
-                System.arraycopy(page.delTimesUnsignedIntegers, 0, delTimesUnsignedIntegers, first, count);
-            }
-            return new FlatView(starts, ends, markedAts, delTimesUnsignedIntegers, size);
-        }
-
-        private long unsharedHeapSize()
-        {
-            return EMPTY_SIZE
                  + ObjectSizes.sizeOfArray(starts)
                  + ObjectSizes.sizeOfArray(ends)
                  + ObjectSizes.sizeOfArray(markedAts)
@@ -1375,11 +1276,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
     public long unsharedHeapSize()
     {
         if (pages != null)
-            return EMPTY_SIZE
-                 + boundaryHeapSize
-                 + ObjectSizes.sizeOfArray(pageStarts)
-                 + (flatView == null ? 0 : flatView.unsharedHeapSize())
-                 + pageStorageSize(pages);
+            return unsharedPagedHeapSize();
 
         return EMPTY_SIZE
              + boundaryHeapSize

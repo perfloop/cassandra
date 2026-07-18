@@ -32,7 +32,6 @@ import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 import org.apache.cassandra.utils.concurrent.OpOrder;
@@ -74,60 +73,49 @@ public class RangeTombstoneListCopyTest
     }
 
     @Test
-    public void pagedSnapshotMatchesFlatRangeQueries()
+    public void fullPageSnapshotDoesNotAliasFlatParentStarts()
     {
-        RangeTombstoneList flat = list(8);
-        RangeTombstoneList snapshot = flat.copyForMemtable();
-
-        assertSameRangeQueries(flat, snapshot);
-
-        flat.add(tombstone(16, 17, 9));
-        snapshot.add(tombstone(16, 17, 9));
-        assertSameRangeQueries(flat, snapshot);
-    }
-
-    @Test
-    public void pagedSnapshotDoesNotAliasFlatParentStarts()
-    {
-        RangeTombstoneList expected = list(2);
+        RangeTombstoneList expected = list(64);
         RangeTombstoneList parent = expected.copy();
         RangeTombstoneList snapshot = parent.copyForMemtable();
 
-        parent.add(tombstone(1, 3, 10));
+        parent.add(tombstone(1, 3, 100));
         assertSameRangeQueries(expected, snapshot);
+        assertTimestamp(snapshot.search(clustering(128)), 64);
     }
 
     @Test
     public void pagedSnapshotSupportsIterationSearchCloneAndTimestampUpdates()
     {
         MutableDeletionInfo merged = MutableDeletionInfo.live();
-        for (int i = 0; i < 8; i++)
+        MutableDeletionInfo expected = MutableDeletionInfo.live();
+        for (int i = 0; i < 129; i++)
         {
-            MutableDeletionInfo update = deletion(tombstone(i * 2, i * 2 + 1, i + 1));
+            RangeTombstone range = tombstone(i * 2, i * 2 + 1, i + 1);
+            MutableDeletionInfo update = deletion(range);
             MutableDeletionInfo next = merged.mutableCopyForMemtable(update);
             next.add(update);
             merged = next;
+            expected.add(range, comparator);
         }
 
-        assertTimestamps(merged.rangeIterator(false), 1, 2, 3, 4, 5, 6, 7, 8);
-        assertTimestamps(merged.rangeIterator(true), 8, 7, 6, 5, 4, 3, 2, 1);
-        assertTimestamps(merged.rangeIterator(slice(4, 11), false), 3, 4, 5, 6);
-        assertTimestamps(merged.rangeIterator(slice(4, 11), true), 6, 5, 4, 3);
-        assertTimestamp(merged.rangeCovering(clustering(0)), 1);
-        assertTimestamp(merged.rangeCovering(clustering(15)), 8);
-        assertNull(merged.rangeCovering(clustering(16)));
+        assertSameDeletionInfo(expected, merged);
+        assertSameTombstones(expected.rangeIterator(slice(126, 259), false), merged.rangeIterator(slice(126, 259), false));
+        assertSameTombstones(expected.rangeIterator(slice(126, 259), true), merged.rangeIterator(slice(126, 259), true));
+        assertTimestamp(merged.rangeCovering(clustering(256)), 129);
+        assertNull(merged.rangeCovering(clustering(258)));
 
         MutableDeletionInfo clone = merged.clone(HeapCloner.instance);
         clone.updateAllTimestamp(99);
-        assertTimestamps(merged.rangeIterator(false), 1, 2, 3, 4, 5, 6, 7, 8);
-        assertTimestamps(clone.rangeIterator(false), 99, 99, 99, 99, 99, 99, 99, 99);
+        assertSameDeletionInfo(expected, merged);
+        assertRepeatedTimestamp(clone.rangeIterator(false), 129, 99);
     }
 
     @Test
     public void orderedSnapshotCopyWithoutRangesKeepsAnIndependentSnapshot()
     {
         MutableDeletionInfo parent = MutableDeletionInfo.live();
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < 65; i++)
         {
             MutableDeletionInfo update = deletion(tombstone(i * 2, i * 2 + 1, i + 1));
             MutableDeletionInfo next = parent.mutableCopyForMemtable(update);
@@ -136,10 +124,12 @@ public class RangeTombstoneListCopyTest
         }
 
         MutableDeletionInfo copy = parent.mutableCopyForMemtable(MutableDeletionInfo.live());
-        parent.add(tombstone(20, 21, 20), comparator);
+        parent.add(tombstone(132, 133, 200), comparator);
 
-        assertTimestamps(copy.rangeIterator(false), 1, 2, 3, 4, 5, 6, 7, 8);
-        assertTimestamps(parent.rangeIterator(false), 1, 2, 3, 4, 5, 6, 7, 8, 20);
+        assertSequentialTimestamps(copy.rangeIterator(false), 65);
+        assertSequentialTimestampsWithTail(parent.rangeIterator(false), 65, 200);
+        assertTimestamp(parent.rangeCovering(clustering(132)), 200);
+        assertNull(copy.rangeCovering(clustering(132)));
     }
 
     @Test
@@ -213,7 +203,7 @@ public class RangeTombstoneListCopyTest
     {
         Fixture fixture = fixture();
         MutableDeletionInfo expected = MutableDeletionInfo.live();
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < 129; i++)
         {
             RangeTombstone range = tombstone(i * 2, i * 2 + 1, i + 1);
             fixture.add(range);
@@ -263,24 +253,45 @@ public class RangeTombstoneListCopyTest
     }
 
     @Test
-    public void firstPagedSnapshotChargesTheIndependentlyCalculatedPageLayout()
+    public void pagedOptimisticChildrenLeavePredecessorOwnershipAccountingIntact()
     {
-        Fixture fixture = fixture();
-        fixture.add(0);
+        // A partial final page makes an ordered child detach that page before appending. The source
+        // remains the owner of the shared full-page prefix. This is important
+        // for a failed AtomicBTreePartition CAS: a discarded child must not alter the accounting of
+        // the still-published predecessor.
+        RangeTombstoneList flat = list(65);
+        RangeTombstoneList predecessor = flat.copyForMemtable();
+        long flatBeforeChild = flat.unsharedHeapSize();
+        long predecessorBeforeChild = predecessor.unsharedHeapSize();
 
-        RangeTombstone appended = tombstone(2, 3, 2);
-        long beforeOwned = fixture.allocator.onHeap().owns();
-        fixture.add(appended);
+        RangeTombstoneList append = new RangeTombstoneList(comparator, 1);
+        append.add(tombstone(132, 133, 66));
+        RangeTombstoneList successor = predecessor.copyForMemtable(append);
+        successor.addAll(append);
 
-        long flatArrays = 2 * ObjectSizes.sizeOfReferenceArray(1)
-                        + ObjectSizes.sizeOfArray(new long[1])
-                        + ObjectSizes.sizeOfArray(new int[1]);
-        long expected = pageStorageFor(1)
-                      + ObjectSizes.sizeOfReferenceArray(1)
-                      - flatArrays
-                      + appended.deletedSlice().start().unsharedHeapSize()
-                      + appended.deletedSlice().end().unsharedHeapSize();
-        assertEquals(expected, fixture.allocator.onHeap().owns() - beforeOwned);
+        assertEquals(flatBeforeChild, flat.unsharedHeapSize());
+        assertEquals(predecessorBeforeChild, predecessor.unsharedHeapSize());
+        assertSameRangeQueries(flat, predecessor);
+        assertTimestamp(successor.search(clustering(132)), 66);
+        // The successor owns the copied partial tail and appended bound, not the shared prefix.
+        assertTrue(successor.unsharedHeapSize() < predecessorBeforeChild);
+
+        // This sibling models an optimistic merge that loses its CAS and is discarded. Merely
+        // constructing and mutating it must still leave the published predecessor unchanged.
+        RangeTombstoneList discarded = predecessor.copyForMemtable(append);
+        discarded.addAll(append);
+        assertEquals(predecessorBeforeChild, predecessor.unsharedHeapSize());
+        assertSameRangeQueries(flat, predecessor);
+
+        // A non-append child materializes independently as well; its speculative construction
+        // cannot transfer retained-memory ownership away from the source snapshot.
+        RangeTombstoneList prefix = new RangeTombstoneList(comparator, 1);
+        prefix.add(tombstone(-2, -1, 67));
+        RangeTombstoneList prefixChild = predecessor.copyForMemtable(prefix);
+        prefixChild.addAll(prefix);
+        assertEquals(predecessorBeforeChild, predecessor.unsharedHeapSize());
+        assertSameRangeQueries(flat, predecessor);
+        assertTimestamp(prefixChild.search(clustering(-2)), 67);
     }
 
     @Test
@@ -301,35 +312,43 @@ public class RangeTombstoneListCopyTest
     public void pagedSnapshotFallbackKeepsTheAllocatorInSync()
     {
         Fixture fixture = fixture();
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < 129; i++)
             fixture.add(i);
 
-        assertDeletionAccounting(fixture, () -> fixture.add(tombstone(-4, -3, 20)));
+        assertDeletionAccounting(fixture, () -> fixture.add(tombstone(-4, -3, 200)));
     }
 
     @Test
-    public void pagedSnapshotAccountsEveryRangeInALargeOrderedBatch()
+    public void pagedSnapshotLargeOrderedBatchMatchesFlatReferenceAcrossPages()
     {
         Fixture fixture = fixture();
-        fixture.add(0);
+        fixture.add(tombstone(0, 1, 1));
+        MutableDeletionInfo expected = MutableDeletionInfo.live();
+        expected.add(tombstone(0, 1, 1), comparator);
+        for (int i = 1; i <= 4096; i++)
+            expected.add(tombstone(i * 4, i * 4 + 1, i + 1), comparator);
 
-        assertDeletionAccounting(fixture, () -> fixture.addAll(1, 4096));
+        assertDeletionAccounting(fixture, () -> fixture.addAll(1, 4096, 4));
         DeletionInfo deletionInfo = fixture.partition.deletionInfo();
         assertEquals(4097, deletionInfo.rangeCount());
-        assertTimestamp(deletionInfo.rangeCovering(clustering(0)), 1);
-        assertTimestamp(deletionInfo.rangeCovering(clustering(2)), 2);
-        assertTimestamp(deletionInfo.rangeCovering(clustering(8192)), 4097);
-        assertNull(deletionInfo.rangeCovering(clustering(8194)));
-    }
+        assertSameTombstones(expected.rangeIterator(false), deletionInfo.rangeIterator(false));
+        assertSameTombstones(expected.rangeIterator(true), deletionInfo.rangeIterator(true));
 
-    private static long pageStorageFor(int pageCount)
-    {
-        return ObjectSizes.sizeOfReferenceArray(pageCount)
-             + ObjectSizes.measure(new ExpectedPage())
-             + ObjectSizes.sizeOfReferenceArray(64)
-             + ObjectSizes.sizeOfReferenceArray(64)
-             + ObjectSizes.sizeOfArray(new long[64])
-             + ObjectSizes.sizeOfArray(new int[64]);
+        for (int index = 0; index <= 4096; index++)
+        {
+            assertTimestamp(deletionInfo.rangeCovering(clustering(index * 4)), index + 1);
+            assertTimestamp(deletionInfo.rangeCovering(clustering(index * 4 + 1)), index + 1);
+            assertNull(deletionInfo.rangeCovering(clustering(index * 4 + 2)));
+        }
+
+        for (int boundary = 64; boundary <= 4096; boundary += 64)
+        {
+            int first = Math.max(0, boundary - 2);
+            int last = Math.min(4096, boundary + 1);
+            Slice bounded = slice(first * 4 + 1, last * 4);
+            assertSameTombstones(expected.rangeIterator(bounded, false), deletionInfo.rangeIterator(bounded, false));
+            assertSameTombstones(expected.rangeIterator(bounded, true), deletionInfo.rangeIterator(bounded, true));
+        }
     }
 
     private static void assertDeletionAccountingForNextRange(Fixture fixture, int nextRange)
@@ -346,7 +365,9 @@ public class RangeTombstoneListCopyTest
 
         long afterOwned = fixture.allocator.onHeap().owns();
         MutableDeletionInfo afterDeletionInfo = (MutableDeletionInfo) fixture.partition.deletionInfo();
-        long expectedDelta = afterDeletionInfo.unsharedHeapSize() - beforeDeletionInfo.unsharedHeapSize();
+        long expectedDelta = afterDeletionInfo.memtableUnsharedHeapSize()
+                           - beforeDeletionInfo.memtableUnsharedHeapSize()
+                           + afterDeletionInfo.pageAllocationOnHeap();
         assertEquals(expectedDelta, afterOwned - beforeOwned);
     }
 
@@ -367,9 +388,14 @@ public class RangeTombstoneListCopyTest
 
     private static PartitionUpdate update(TableMetadata metadata, DecoratedKey key, int firstIndex, int count)
     {
+        return update(metadata, key, firstIndex, count, 2);
+    }
+
+    private static PartitionUpdate update(TableMetadata metadata, DecoratedKey key, int firstIndex, int count, int stride)
+    {
         MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
         for (int i = firstIndex; i < firstIndex + count; i++)
-            deletionInfo.add(tombstone(i * 2, i * 2 + 1, i + 1), comparator);
+            deletionInfo.add(tombstone(i * stride, i * stride + 1, i + 1), comparator);
 
         BTreePartitionData holder = BTreePartitionData.unsafeConstruct(RegularAndStaticColumns.NONE,
                                                                         BTree.empty(),
@@ -476,6 +502,38 @@ public class RangeTombstoneListCopyTest
         assertEquals(timestamp, tombstone.deletionTime().markedForDeleteAt());
     }
 
+    private static void assertSequentialTimestamps(Iterator<RangeTombstone> tombstones, int count)
+    {
+        for (int timestamp = 1; timestamp <= count; timestamp++)
+        {
+            assertTrue(tombstones.hasNext());
+            assertTimestamp(tombstones.next(), timestamp);
+        }
+        assertFalse(tombstones.hasNext());
+    }
+
+    private static void assertRepeatedTimestamp(Iterator<RangeTombstone> tombstones, int count, long timestamp)
+    {
+        for (int index = 0; index < count; index++)
+        {
+            assertTrue(tombstones.hasNext());
+            assertTimestamp(tombstones.next(), timestamp);
+        }
+        assertFalse(tombstones.hasNext());
+    }
+
+    private static void assertSequentialTimestampsWithTail(Iterator<RangeTombstone> tombstones, int count, long tailTimestamp)
+    {
+        for (int timestamp = 1; timestamp <= count; timestamp++)
+        {
+            assertTrue(tombstones.hasNext());
+            assertTimestamp(tombstones.next(), timestamp);
+        }
+        assertTrue(tombstones.hasNext());
+        assertTimestamp(tombstones.next(), tailTimestamp);
+        assertFalse(tombstones.hasNext());
+    }
+
     private static void assertTimestamps(Iterator<RangeTombstone> tombstones, long... timestamps)
     {
         for (long timestamp : timestamps)
@@ -484,14 +542,6 @@ public class RangeTombstoneListCopyTest
             assertTimestamp(tombstones.next(), timestamp);
         }
         assertFalse(tombstones.hasNext());
-    }
-
-    private static final class ExpectedPage
-    {
-        private Object starts;
-        private Object ends;
-        private Object markedAts;
-        private Object delTimesUnsignedIntegers;
     }
 
     private static final class Fixture
@@ -531,6 +581,11 @@ public class RangeTombstoneListCopyTest
         private void addAll(int firstIndex, int count)
         {
             partition.addAll(update(metadata, key, firstIndex, count), cloner, writeOp, UpdateTransaction.NO_OP);
+        }
+
+        private void addAll(int firstIndex, int count, int stride)
+        {
+            partition.addAll(update(metadata, key, firstIndex, count, stride), cloner, writeOp, UpdateTransaction.NO_OP);
         }
     }
 }
