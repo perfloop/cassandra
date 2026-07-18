@@ -99,8 +99,6 @@ public class LocalReadResponseBench
             {
                 byte[] value = new byte[valueBytes];
                 ThreadLocalRandom.current().nextBytes(value);
-                value[0] ^= (byte) row;
-                value[value.length - 1] ^= (byte) column;
                 rowBuilder.add("v" + column, ByteBuffer.wrap(value));
             }
         }
@@ -111,7 +109,7 @@ public class LocalReadResponseBench
     @Benchmark
     public long materializeAndConsume()
     {
-        ReadResponse response = ReadResponse.createDataResponse(new SingletonUnfilteredPartitionIterator(partition.unfilteredIterator()), command);
+        ReadResponse response = ReadResponse.createLocalDataResponse(new SingletonUnfilteredPartitionIterator(partition.unfilteredIterator()), command);
         return checksum(response.makeIterator(command));
     }
 

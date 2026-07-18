@@ -22,7 +22,6 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
-import java.util.NoSuchElementException;
 
 import com.google.common.annotations.VisibleForTesting;
 
@@ -37,6 +36,7 @@ import org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.DeserializationHelper;
 import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.Unfiltered;
@@ -52,6 +52,7 @@ import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.ExpMovingAverage;
 import org.apache.cassandra.utils.MovingAverage;
+import org.apache.cassandra.utils.memory.ByteBufferCloner;
 
 import static org.apache.cassandra.db.RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO;
 
@@ -66,10 +67,20 @@ public abstract class ReadResponse
 
     public static ReadResponse createDataResponse(UnfilteredPartitionIterator data, ReadCommand command, RepairedDataInfo rdi)
     {
-        return new LocalDataResponse(data, command, rdi);
+        return new SerializedDataResponse(data, command, rdi);
     }
 
     public static ReadResponse createDataResponse(UnfilteredPartitionIterator data, ReadCommand command)
+    {
+        return new SerializedDataResponse(data, command, NO_OP_REPAIRED_DATA_INFO);
+    }
+
+    public static ReadResponse createLocalDataResponse(UnfilteredPartitionIterator data, ReadCommand command, RepairedDataInfo rdi)
+    {
+        return new LocalDataResponse(data, command, rdi);
+    }
+
+    public static ReadResponse createLocalDataResponse(UnfilteredPartitionIterator data, ReadCommand command)
     {
         return new LocalDataResponse(data, command, NO_OP_REPAIRED_DATA_INFO);
     }
@@ -178,7 +189,7 @@ public abstract class ReadResponse
             // so we effectively deserialize and then reserialize in order to apply the limits
             // Wasteful, but better than sending it to the coordinator to do it
             UnfilteredPartitionIterator filtered = command.limits().filter(UnfilteredPartitionIterators.concat(iterators), 0, command.selectsFullPartition());
-            return new LocalDataResponse(filtered, command, NO_OP_REPAIRED_DATA_INFO);
+            return new SerializedDataResponse(filtered, command, NO_OP_REPAIRED_DATA_INFO);
         }
     }
 
@@ -235,7 +246,19 @@ public abstract class ReadResponse
         }
     }
 
-    // built on the owning node responding to a query
+    // built on a replica that must serialize its response for a remote coordinator
+    private static class SerializedDataResponse extends DataResponse
+    {
+        private SerializedDataResponse(UnfilteredPartitionIterator iter, ReadCommand command, RepairedDataInfo rdi)
+        {
+            super(LocalDataResponse.build(iter, command.columnFilter()),
+                  rdi.getDigest(), rdi.isConclusive(),
+                  MessagingService.current_version,
+                  DeserializationHelper.Flag.LOCAL);
+        }
+    }
+
+    // built on the coordinator when it is also the owning replica
     private static class LocalDataResponse extends DataResponse
     {
         // Exponential moving average of response sizes, used to set initial size of output buffer.
@@ -367,7 +390,6 @@ public abstract class ReadResponse
 
         private static class LocalPartition
         {
-            private final TableMetadata metadata;
             private final DecoratedKey key;
             private final DeletionTime partitionDeletion;
             private final RegularAndStaticColumns columns;
@@ -378,19 +400,26 @@ public abstract class ReadResponse
 
             private LocalPartition(UnfilteredRowIterator partition)
             {
-                metadata = partition.metadata();
-                key = partition.partitionKey();
+                ByteBufferCloner cloner = new ArenaCloner();
+                DecoratedKey sourceKey = partition.partitionKey();
+                key = new BufferDecoratedKey(sourceKey.getToken(), cloner.clone(sourceKey.getKey()));
                 partitionDeletion = partition.partitionLevelDeletion();
                 columns = partition.columns();
-                staticRow = partition.staticRow();
+                Row sourceStaticRow = partition.staticRow();
+                staticRow = sourceStaticRow == Rows.EMPTY_STATIC_ROW ? sourceStaticRow : sourceStaticRow.clone(cloner);
                 isReverseOrder = partition.isReverseOrder();
                 stats = partition.stats();
                 unfiltereds = new ArrayList<>();
                 while (partition.hasNext())
-                    unfiltereds.add(partition.next());
+                {
+                    Unfiltered unfiltered = partition.next();
+                    unfiltereds.add(unfiltered.isRow()
+                                    ? ((Row) unfiltered).clone(cloner)
+                                    : ((RangeTombstoneMarker) unfiltered).clone(cloner));
+                }
             }
 
-            private UnfilteredRowIterator iterator()
+            private UnfilteredRowIterator iterator(TableMetadata metadata)
             {
                 return new AbstractUnfilteredRowIterator(metadata,
                                                          key,
@@ -411,12 +440,41 @@ public abstract class ReadResponse
             }
         }
 
+        private static class ArenaCloner extends ByteBufferCloner
+        {
+            private static final int INITIAL_CHUNK_SIZE = 1024;
+
+            private ByteBuffer buffer;
+            private int nextChunkSize = INITIAL_CHUNK_SIZE;
+
+            @Override
+            public boolean isContextAwareCloningSupported()
+            {
+                return false;
+            }
+
+            @Override
+            public ByteBuffer allocate(int size)
+            {
+                if (buffer == null || buffer.remaining() < size)
+                {
+                    int capacity = Math.max(size, nextChunkSize);
+                    buffer = ByteBuffer.allocate(capacity);
+                    nextChunkSize = capacity > Integer.MAX_VALUE / 2 ? Integer.MAX_VALUE : capacity * 2;
+                }
+
+                ByteBuffer slice = buffer.slice();
+                slice.limit(size);
+                buffer.position(buffer.position() + size);
+                return slice;
+            }
+        }
+
         private static class LocalPartitionIterator extends AbstractUnfilteredPartitionIterator
         {
             private final TableMetadata metadata;
             private final Iterator<LocalPartition> partitions;
             private final boolean clearLocalCounterContext;
-            private UnfilteredRowIterator current;
 
             private LocalPartitionIterator(TableMetadata metadata, List<LocalPartition> partitions, boolean clearLocalCounterContext)
             {
@@ -434,32 +492,14 @@ public abstract class ReadResponse
             @Override
             public boolean hasNext()
             {
-                drainCurrentPartition();
                 return partitions.hasNext();
             }
 
             @Override
             public UnfilteredRowIterator next()
             {
-                if (!hasNext())
-                    throw new NoSuchElementException();
-
-                current = partitions.next().iterator();
-                return clearLocalCounterContext ? Transformation.apply(current, CLEAR_LOCAL_COUNTER_CONTEXT) : current;
-            }
-
-            @Override
-            public void close()
-            {
-                if (current != null)
-                    current.close();
-            }
-
-            private void drainCurrentPartition()
-            {
-                if (current != null)
-                    while (current.hasNext())
-                        current.next();
+                UnfilteredRowIterator partition = partitions.next().iterator(metadata);
+                return clearLocalCounterContext ? Transformation.apply(partition, CLEAR_LOCAL_COUNTER_CONTEXT) : partition;
             }
         }
     }

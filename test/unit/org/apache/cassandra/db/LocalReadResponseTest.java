@@ -19,6 +19,7 @@ package org.apache.cassandra.db;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -34,6 +35,7 @@ import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.partitions.SingletonUnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
@@ -77,7 +79,7 @@ public class LocalReadResponseTest
         ExhaustionTrackingPartitionIterator data = new ExhaustionTrackingPartitionIterator(new SingletonUnfilteredPartitionIterator(partition.unfilteredIterator()));
         ByteBuffer repairedDigest = ByteBufferUtil.bytes("repaired-data");
         ExhaustionTrackingRepairedDataInfo repairedDataInfo = new ExhaustionTrackingRepairedDataInfo(data, repairedDigest);
-        ReadResponse response = ReadResponse.createDataResponse(data, command, repairedDataInfo);
+        ReadResponse response = ReadResponse.createLocalDataResponse(data, command, repairedDataInfo);
 
         assertTrue("the response must finish consuming the local input before reading its repaired digest", data.rowsExhausted);
         assertTrue("the repaired digest must be read after the local input is materialized", repairedDataInfo.digestRead);
@@ -122,7 +124,7 @@ public class LocalReadResponseTest
         secondBuilder.row(5).add("v1", "second value");
         PartitionUpdate second = secondBuilder.build();
 
-        ReadResponse local = ReadResponse.createDataResponse(partitions(first, second), command);
+        ReadResponse local = ReadResponse.createLocalDataResponse(partitions(first, second), command);
         ReadResponse remote = ReadResponse.createRemoteDataResponse(partitions(first, second), ByteBufferUtil.EMPTY_BYTE_BUFFER, true, command, MessagingService.current_version);
         ByteBuffer expectedWireResponse = serialized(remote);
 
@@ -130,6 +132,86 @@ public class LocalReadResponseTest
         assertEquals(digest(remote, command), digest(local, command));
         assertEquals(digest(remote, command), digest(local, command));
         assertEquals(expectedWireResponse, serialized(local));
+    }
+
+    @Test
+    public void localResponseOwnsDataReturnedByEphemeralIterators() throws IOException
+    {
+        TableMetadata metadata = regularMetadata();
+        byte[] keyValue = Int32Type.instance.decompose(5).array();
+        DecoratedKey key = metadata.partitioner.decorateKey(ByteBuffer.wrap(keyValue));
+        ReadCommand command = SinglePartitionReadCommand.fullPartitionRead(metadata, FBUtilities.nowInSeconds(), key);
+
+        byte[] staticValue = "static value".getBytes(StandardCharsets.UTF_8);
+        byte[] firstValue = "first value".getBytes(StandardCharsets.UTF_8);
+        byte[] secondValue = "second value".getBytes(StandardCharsets.UTF_8);
+        byte[] markerStart = Int32Type.instance.decompose(3).array();
+        byte[] markerEnd = Int32Type.instance.decompose(4).array();
+        byte[] expectedKey = keyValue.clone();
+        byte[] expectedStatic = staticValue.clone();
+        byte[] expectedFirst = firstValue.clone();
+        byte[] expectedSecond = secondValue.clone();
+        byte[] expectedMarkerStart = markerStart.clone();
+        byte[] expectedMarkerEnd = markerEnd.clone();
+
+        PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(metadata, key).timestamp(1L);
+        builder.row().add("static_value", ByteBuffer.wrap(staticValue));
+        builder.row(1).add("v0", ByteBuffer.wrap(firstValue));
+        builder.row(2).add("v0", ByteBuffer.wrap(secondValue));
+        builder.addRangeTombstone(new RangeTombstone(Slice.make(BufferClusteringBound.inclusiveStartOf(ByteBuffer.wrap(markerStart)),
+                                                                 BufferClusteringBound.inclusiveEndOf(ByteBuffer.wrap(markerEnd))),
+                                                      DeletionTime.build(1L, FBUtilities.nowInSeconds())));
+        PartitionUpdate partition = builder.build();
+
+        UnfilteredRowIterator ephemeral = new InvalidatingRowIterator(partition.unfilteredIterator(),
+                                                                        keyValue,
+                                                                        staticValue,
+                                                                        firstValue,
+                                                                        secondValue,
+                                                                        markerStart);
+        ReadResponse response = ReadResponse.createLocalDataResponse(new SingletonUnfilteredPartitionIterator(ephemeral), command);
+
+        assertFalse(ByteBuffer.wrap(expectedKey).equals(ByteBuffer.wrap(keyValue)));
+        assertFalse(ByteBuffer.wrap(expectedStatic).equals(ByteBuffer.wrap(staticValue)));
+        assertFalse(ByteBuffer.wrap(expectedFirst).equals(ByteBuffer.wrap(firstValue)));
+        assertFalse(ByteBuffer.wrap(expectedSecond).equals(ByteBuffer.wrap(secondValue)));
+        assertFalse(ByteBuffer.wrap(expectedMarkerStart).equals(ByteBuffer.wrap(markerStart)));
+        assertSnapshot(response,
+                       command,
+                       metadata,
+                       expectedKey,
+                       expectedStatic,
+                       expectedFirst,
+                       expectedSecond,
+                       expectedMarkerStart,
+                       expectedMarkerEnd);
+        assertSnapshot(response,
+                       command,
+                       metadata,
+                       expectedKey,
+                       expectedStatic,
+                       expectedFirst,
+                       expectedSecond,
+                       expectedMarkerStart,
+                       expectedMarkerEnd);
+        ByteBuffer digest = response.digest(command);
+        assertEquals(digest, response.digest(command));
+
+        ByteBuffer bytes = serialized(response);
+        try (DataInputBuffer in = new DataInputBuffer(bytes, false))
+        {
+            ReadResponse remote = ReadResponse.serializer.deserialize(in, MessagingService.current_version);
+            assertSnapshot(remote,
+                           command,
+                           metadata,
+                           expectedKey,
+                           expectedStatic,
+                           expectedFirst,
+                           expectedSecond,
+                           expectedMarkerStart,
+                           expectedMarkerEnd);
+            assertEquals(digest, remote.digest(command));
+        }
     }
 
     @Test
@@ -152,7 +234,7 @@ public class LocalReadResponseTest
         builder.row(1).add("count", markedCounterContext);
         PartitionUpdate partition = builder.build();
 
-        ReadResponse local = ReadResponse.createDataResponse(new SingletonUnfilteredPartitionIterator(partition.unfilteredIterator()), command);
+        ReadResponse local = ReadResponse.createLocalDataResponse(new SingletonUnfilteredPartitionIterator(partition.unfilteredIterator()), command);
         ReadResponse remote = ReadResponse.createRemoteDataResponse(new SingletonUnfilteredPartitionIterator(partition.unfilteredIterator()),
                                                                       null,
                                                                       false,
@@ -200,6 +282,49 @@ public class LocalReadResponseTest
     private static ByteBuffer digest(ReadResponse response, ReadCommand command)
     {
         return response.digest(command);
+    }
+
+    private static void assertSnapshot(ReadResponse response,
+                                       ReadCommand command,
+                                       TableMetadata metadata,
+                                       byte[] key,
+                                       byte[] staticValue,
+                                       byte[] firstValue,
+                                       byte[] secondValue,
+                                       byte[] markerStart,
+                                       byte[] markerEnd)
+    {
+        try (UnfilteredPartitionIterator partitions = response.makeIterator(command))
+        {
+            assertTrue(partitions.hasNext());
+            try (UnfilteredRowIterator partition = partitions.next())
+            {
+                assertEquals(ByteBuffer.wrap(key), partition.partitionKey().getKey());
+                assertCellValue(partition.staticRow(), metadata, "static_value", staticValue);
+                assertTrue(partition.hasNext());
+                assertCellValue((Row) partition.next(), metadata, "v0", firstValue);
+                assertTrue(partition.hasNext());
+                assertCellValue((Row) partition.next(), metadata, "v0", secondValue);
+                assertTrue(partition.hasNext());
+                assertMarker((RangeTombstoneMarker) partition.next(), markerStart);
+                assertTrue(partition.hasNext());
+                assertMarker((RangeTombstoneMarker) partition.next(), markerEnd);
+                assertFalse(partition.hasNext());
+            }
+            assertFalse(partitions.hasNext());
+        }
+    }
+
+    private static void assertMarker(RangeTombstoneMarker marker, byte[] value)
+    {
+        assertEquals(ByteBuffer.wrap(value), marker.clustering().bufferAt(0));
+    }
+
+    private static void assertCellValue(Row row, TableMetadata metadata, String columnName, byte[] value)
+    {
+        Cell<?> cell = row.getCell(metadata.getColumn(ByteBufferUtil.bytes(columnName)));
+        assertNotNull(cell);
+        assertEquals(ByteBuffer.wrap(value), cell.buffer());
     }
 
     private static TableMetadata regularMetadata()
@@ -294,6 +419,71 @@ public class LocalReadResponseTest
                 assertNotNull(cell);
                 return cell.buffer().duplicate();
             }
+        }
+    }
+
+    private static class InvalidatingRowIterator implements WrappingUnfilteredRowIterator
+    {
+        private final UnfilteredRowIterator wrapped;
+        private final byte[] key;
+        private final byte[] staticValue;
+        private final byte[] firstValue;
+        private final byte[] secondValue;
+        private final byte[] markerStart;
+        private boolean returnedRow;
+        private boolean returnedMarker;
+        private boolean rowsInvalidated;
+        private boolean markerInvalidated;
+
+        private InvalidatingRowIterator(UnfilteredRowIterator wrapped,
+                                        byte[] key,
+                                        byte[] staticValue,
+                                        byte[] firstValue,
+                                        byte[] secondValue,
+                                        byte[] markerStart)
+        {
+            this.wrapped = wrapped;
+            this.key = key;
+            this.staticValue = staticValue;
+            this.firstValue = firstValue;
+            this.secondValue = secondValue;
+            this.markerStart = markerStart;
+        }
+
+        public UnfilteredRowIterator wrapped()
+        {
+            return wrapped;
+        }
+
+        public boolean hasNext()
+        {
+            if (returnedRow && !rowsInvalidated)
+            {
+                staticValue[0] ^= 1;
+                firstValue[0] ^= 1;
+                rowsInvalidated = true;
+            }
+            if (returnedMarker && !markerInvalidated)
+            {
+                markerStart[markerStart.length - 1] ^= 1;
+                markerInvalidated = true;
+            }
+            return wrapped.hasNext();
+        }
+
+        public Unfiltered next()
+        {
+            Unfiltered next = wrapped.next();
+            returnedRow |= next.isRow();
+            returnedMarker |= next.isRangeTombstoneMarker();
+            return next;
+        }
+
+        public void close()
+        {
+            key[key.length - 1] ^= 1;
+            secondValue[0] ^= 1;
+            wrapped.close();
         }
     }
 
