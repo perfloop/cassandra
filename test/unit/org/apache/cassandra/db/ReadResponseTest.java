@@ -268,6 +268,26 @@ public class ReadResponseTest
     }
 
     @Test
+    public void simpleDataResponsePreservesSourceOrderAfterSerialization()
+    {
+        TableMetadata clusteredMetadata = clusteredMetadata();
+        int key = key();
+        PartitionUpdate update = multiRowUpdate(clusteredMetadata, key);
+        ColumnFilter selection = ColumnFilter.all(clusteredMetadata);
+
+        for (boolean isReversed : Arrays.asList(false, true))
+        {
+            ReadCommand command = command(key, clusteredMetadata, isReversed);
+            ReadResponse response = ReadResponse.createSimpleDataResponse(new SingletonUnfilteredPartitionIterator(update.unfilteredIterator(selection, Slices.ALL, isReversed)), selection);
+            List<Integer> expected = isReversed ? Arrays.asList(3, 2, 1) : Arrays.asList(1, 2, 3);
+
+            assertEquals(expected, clusteringValues(response, command));
+            for (MessagingService.Version version : MessagingService.Version.supportedVersions())
+                assertEquals(expected, clusteringValues(roundTripSerialization(response, version.value), command));
+        }
+    }
+
+    @Test
     public void mergedLocalDataResponseReplaysMultiplePartitions()
     {
         int first = 1;
@@ -283,13 +303,14 @@ public class ReadResponseTest
         ReadResponse firstResponse = command.createResponse(new SingletonUnfilteredPartitionIterator(update(metadata, first).unfilteredIterator()), RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO);
         ReadResponse secondResponse = command.createResponse(new SingletonUnfilteredPartitionIterator(update(metadata, second).unfilteredIterator()), RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO);
         ReadResponse merged = ReadResponse.merge(Arrays.asList(firstResponse, secondResponse), command);
+        ReadResponse materialized = command.createResponse(merged.makeIterator(command), RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO);
         List<ByteBuffer> expectedKeys = Arrays.asList(ByteBufferUtil.bytes(first), ByteBufferUtil.bytes(second));
         List<List<Integer>> expectedRows = Arrays.asList(Arrays.asList(first), Arrays.asList(second));
 
-        assertPartitionContents(merged, command, expectedKeys, expectedRows);
-        assertPartitionContents(merged, command, expectedKeys, expectedRows);
+        assertPartitionContents(materialized, command, expectedKeys, expectedRows);
+        assertPartitionContents(materialized, command, expectedKeys, expectedRows);
         for (MessagingService.Version version : MessagingService.Version.supportedVersions())
-            assertPartitionContents(roundTripSerialization(merged, version.value), command, expectedKeys, expectedRows);
+            assertPartitionContents(roundTripSerialization(materialized, version.value), command, expectedKeys, expectedRows);
     }
 
     private static UnfilteredPartitionIterator trackingPartitions(PartitionUpdate update, SourceConsumption sourceConsumption)
@@ -398,9 +419,43 @@ public class ReadResponseTest
         assertEquals(expectedRows, rows);
     }
 
+    private static List<Integer> clusteringValues(ReadResponse response, ReadCommand command)
+    {
+        List<Integer> values = new ArrayList<>();
+        try (UnfilteredPartitionIterator partitions = response.makeIterator(command))
+        {
+            assertTrue(partitions.hasNext());
+            try (UnfilteredRowIterator partition = partitions.next())
+            {
+                while (partition.hasNext())
+                    values.add(Int32Type.instance.compose(((Row) partition.next()).clustering().bufferAt(0)));
+            }
+            assertFalse(partitions.hasNext());
+        }
+        return values;
+    }
+
     private static PartitionUpdate update(TableMetadata metadata, int key)
     {
         return new RowUpdateBuilder(metadata, 1L, key).add("v", key).buildUpdate();
+    }
+
+    private static PartitionUpdate multiRowUpdate(TableMetadata metadata, int key)
+    {
+        return PartitionUpdate.merge(Arrays.asList(new RowUpdateBuilder(metadata, 1L, key).clustering(1).add("v", 1).buildUpdate(),
+                                                   new RowUpdateBuilder(metadata, 1L, key).clustering(2).add("v", 2).buildUpdate(),
+                                                   new RowUpdateBuilder(metadata, 1L, key).clustering(3).add("v", 3).buildUpdate()));
+    }
+
+    private static TableMetadata clusteredMetadata()
+    {
+        return TableMetadata.builder("ks", "clustered")
+                            .offline()
+                            .addPartitionKeyColumn("p", Int32Type.instance)
+                            .addClusteringColumn("c", Int32Type.instance)
+                            .addRegularColumn("v", Int32Type.instance)
+                            .partitioner(Murmur3Partitioner.instance)
+                            .build();
     }
 
     private TableMetadata counterMetadata()
@@ -470,7 +525,12 @@ public class ReadResponseTest
 
     private ReadCommand command(int key, TableMetadata metadata)
     {
-        return new StubReadCommand(key, metadata, false);
+        return command(key, metadata, false);
+    }
+
+    private ReadCommand command(int key, TableMetadata metadata, boolean isReversed)
+    {
+        return new StubReadCommand(key, metadata, false, isReversed);
     }
 
     private static class StubRepairedDataInfo extends RepairedDataInfo
@@ -502,6 +562,11 @@ public class ReadResponseTest
     {
         StubReadCommand(int key, TableMetadata metadata, boolean isDigest)
         {
+            this(key, metadata, isDigest, false);
+        }
+
+        StubReadCommand(int key, TableMetadata metadata, boolean isDigest, boolean isReversed)
+        {
             super(metadata.epoch,
                   isDigest,
                   0,
@@ -513,7 +578,7 @@ public class ReadResponseTest
                   RowFilter.none(),
                   DataLimits.NONE,
                   metadata.partitioner.decorateKey(ByteBufferUtil.bytes(key)),
-                  new ClusteringIndexSliceFilter(Slices.ALL, false),
+                  new ClusteringIndexSliceFilter(Slices.ALL, isReversed),
                   null,
                   false,
                   null);

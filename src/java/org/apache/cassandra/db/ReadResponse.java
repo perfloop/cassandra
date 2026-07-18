@@ -180,7 +180,7 @@ public abstract class ReadResponse
             // so we effectively deserialize and then reserialize in order to apply the limits
             // Wasteful, but better than sending it to the coordinator to do it
             UnfilteredPartitionIterator filtered = command.limits().filter(UnfilteredPartitionIterators.concat(iterators), 0, command.selectsFullPartition());
-            return new LocalDataResponse(filtered, command, NO_OP_REPAIRED_DATA_INFO);
+            return createDataResponseForRemote(filtered, command, NO_OP_REPAIRED_DATA_INFO);
         }
     }
 
@@ -260,7 +260,12 @@ public abstract class ReadResponse
 
         private LocalDataResponse(UnfilteredPartitionIterator iter, ColumnFilter selection)
         {
-            this(materialize(iter), selection, false, null, false);
+            this(materialize(iter), selection);
+        }
+
+        private LocalDataResponse(MaterializedData data, ColumnFilter selection)
+        {
+            this(data, selection, data.isReversed, ByteBufferUtil.EMPTY_BYTE_BUFFER, false);
         }
 
         private LocalDataResponse(MaterializedData data,
@@ -279,14 +284,20 @@ public abstract class ReadResponse
         private static MaterializedData materialize(UnfilteredPartitionIterator iter)
         {
             List<ImmutableBTreePartition> partitions = new ArrayList<>();
+            boolean isReversed = false;
             while (iter.hasNext())
             {
                 try (UnfilteredRowIterator partition = iter.next())
                 {
+                    if (partitions.isEmpty())
+                        isReversed = partition.isReverseOrder();
+                    else
+                        assert isReversed == partition.isReverseOrder();
+
                     partitions.add(ImmutableBTreePartition.create(clearLocalCounterContexts(partition)));
                 }
             }
-            return new MaterializedData(iter.metadata(), partitions);
+            return new MaterializedData(iter.metadata(), partitions, isReversed);
         }
 
         private static UnfilteredRowIterator clearLocalCounterContexts(UnfilteredRowIterator partition)
@@ -412,11 +423,13 @@ public abstract class ReadResponse
         {
             private final TableMetadata metadata;
             private final List<ImmutableBTreePartition> partitions;
+            private final boolean isReversed;
 
-            private MaterializedData(TableMetadata metadata, List<ImmutableBTreePartition> partitions)
+            private MaterializedData(TableMetadata metadata, List<ImmutableBTreePartition> partitions, boolean isReversed)
             {
                 this.metadata = metadata;
                 this.partitions = partitions;
+                this.isReversed = isReversed;
             }
         }
     }
