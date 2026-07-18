@@ -16,7 +16,14 @@
  */
 package org.apache.cassandra.db;
 
+import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -32,6 +39,7 @@ import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 import org.apache.cassandra.utils.concurrent.OpOrder;
@@ -73,7 +81,7 @@ public class RangeTombstoneListCopyTest
     }
 
     @Test
-    public void persistentSnapshotMatchesFlatRangeQueries()
+    public void pagedSnapshotMatchesFlatRangeQueries()
     {
         RangeTombstoneList flat = list(8);
         RangeTombstoneList snapshot = flat.copyForMemtable();
@@ -86,7 +94,18 @@ public class RangeTombstoneListCopyTest
     }
 
     @Test
-    public void persistentSnapshotSupportsIterationSearchCloneAndTimestampUpdates()
+    public void pagedSnapshotDoesNotAliasFlatParentStarts()
+    {
+        RangeTombstoneList expected = list(2);
+        RangeTombstoneList parent = expected.copy();
+        RangeTombstoneList snapshot = parent.copyForMemtable();
+
+        parent.add(tombstone(1, 3, 10));
+        assertSameRangeQueries(expected, snapshot);
+    }
+
+    @Test
+    public void pagedSnapshotSupportsIterationSearchCloneAndTimestampUpdates()
     {
         MutableDeletionInfo merged = MutableDeletionInfo.live();
         for (int i = 0; i < 8; i++)
@@ -109,6 +128,25 @@ public class RangeTombstoneListCopyTest
         clone.updateAllTimestamp(99);
         assertTimestamps(merged.rangeIterator(false), 1, 2, 3, 4, 5, 6, 7, 8);
         assertTimestamps(clone.rangeIterator(false), 99, 99, 99, 99, 99, 99, 99, 99);
+    }
+
+    @Test
+    public void orderedSnapshotCopyWithoutRangesKeepsAnIndependentSnapshot()
+    {
+        MutableDeletionInfo parent = MutableDeletionInfo.live();
+        for (int i = 0; i < 8; i++)
+        {
+            MutableDeletionInfo update = deletion(tombstone(i * 2, i * 2 + 1, i + 1));
+            MutableDeletionInfo next = parent.mutableCopyForMemtable(update);
+            next.add(update);
+            parent = next;
+        }
+
+        MutableDeletionInfo copy = parent.mutableCopyForMemtable(MutableDeletionInfo.live());
+        parent.add(tombstone(20, 21, 20), comparator);
+
+        assertTimestamps(copy.rangeIterator(false), 1, 2, 3, 4, 5, 6, 7, 8);
+        assertTimestamps(parent.rangeIterator(false), 1, 2, 3, 4, 5, 6, 7, 8, 20);
     }
 
     @Test
@@ -144,6 +182,110 @@ public class RangeTombstoneListCopyTest
     }
 
     @Test
+    public void concurrentSiblingSnapshotsDoNotShareAppendState() throws Exception
+    {
+        RangeTombstoneList expectedParent = list(2);
+        RangeTombstoneList parent = expectedParent.copyForMemtable();
+        ExecutorService executor = Executors.newFixedThreadPool(4);
+        CountDownLatch ready = new CountDownLatch(4);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<RangeTombstoneList>> children = new ArrayList<>();
+
+        try
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                final int childIndex = i;
+                children.add(executor.submit(() ->
+                {
+                    ready.countDown();
+                    start.await();
+                    RangeTombstoneList child = parent.copyForMemtable();
+                    child.add(tombstone(20 + childIndex * 2, 21 + childIndex * 2, 10 + childIndex));
+                    return child;
+                }));
+            }
+
+            assertTrue(ready.await(10, TimeUnit.SECONDS));
+            start.countDown();
+            for (int i = 0; i < children.size(); i++)
+            {
+                RangeTombstoneList expectedChild = list(2);
+                expectedChild.add(tombstone(20 + i * 2, 21 + i * 2, 10 + i));
+                assertSameRangeQueries(expectedChild, children.get(i).get(10, TimeUnit.SECONDS));
+            }
+        }
+        finally
+        {
+            executor.shutdownNow();
+        }
+
+        parent.add(tombstone(30, 31, 20));
+        expectedParent.add(tombstone(30, 31, 20));
+        assertSameRangeQueries(expectedParent, parent);
+        for (int i = 0; i < children.size(); i++)
+        {
+            RangeTombstoneList expectedChild = list(2);
+            expectedChild.add(tombstone(20 + i * 2, 21 + i * 2, 10 + i));
+            assertSameRangeQueries(expectedChild, children.get(i).get(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    public void orderedSnapshotFallbackMatchesPrefixOverlapAndTimestampMutations()
+    {
+        Fixture fixture = fixture();
+        MutableDeletionInfo expected = MutableDeletionInfo.live();
+        for (int i = 0; i < 8; i++)
+        {
+            RangeTombstone range = tombstone(i * 2, i * 2 + 1, i + 1);
+            fixture.add(range);
+            expected.add(range, comparator);
+        }
+
+        RangeTombstone prefix = tombstone(-4, -3, 20);
+        RangeTombstone overlap = tombstone(5, 10, 30);
+        fixture.add(prefix);
+        fixture.add(overlap);
+        expected.add(prefix, comparator);
+        expected.add(overlap, comparator);
+
+        MutableDeletionInfo actual = (MutableDeletionInfo) fixture.partition.deletionInfo();
+        assertSameDeletionInfo(expected, actual);
+
+        actual.updateAllTimestamp(40);
+        expected.updateAllTimestamp(40);
+        assertSameDeletionInfo(expected, actual);
+
+        actual.updateAllTimestampAndLocalDeletionTime(50, 60);
+        expected.updateAllTimestampAndLocalDeletionTime(50, 60);
+        assertSameDeletionInfo(expected, actual);
+    }
+
+    @Test
+    public void publishedRangeReadsDoNotRetainSnapshotStorage()
+    {
+        Fixture fixture = fixture();
+        for (int i = 0; i < 256; i++)
+            fixture.add(i);
+
+        MutableDeletionInfo deletionInfo = (MutableDeletionInfo) fixture.partition.deletionInfo();
+        long beforeOwned = fixture.allocator.onHeap().owns();
+        long beforeRetained = deletionInfo.unsharedHeapSize();
+
+        assertTimestamp(deletionInfo.rangeCovering(clustering(510)), 256);
+
+        long afterOwned = fixture.allocator.onHeap().owns();
+        long afterRetained = deletionInfo.unsharedHeapSize();
+        assertEquals(beforeOwned, afterOwned);
+        assertEquals(beforeRetained, afterRetained);
+
+        deletionInfo.rangeCovering(clustering(510));
+        assertEquals(beforeOwned, fixture.allocator.onHeap().owns());
+        assertEquals(beforeRetained, deletionInfo.unsharedHeapSize());
+    }
+
+    @Test
     public void orderedSnapshotAccountingMatchesTheAtomicMemtableDelta()
     {
         Fixture fixture = fixture();
@@ -155,28 +297,67 @@ public class RangeTombstoneListCopyTest
     }
 
     @Test
-    public void persistentTreeAccountingStaysInSyncAcrossGrowthAndReadCaching()
+    public void firstPagedSnapshotChargesTheIndependentlyCalculatedPageLayout()
+    {
+        Fixture fixture = fixture();
+        fixture.add(0);
+
+        RangeTombstone appended = tombstone(2, 3, 2);
+        long beforeOwned = fixture.allocator.onHeap().owns();
+        fixture.add(appended);
+
+        long flatArrays = 2 * ObjectSizes.sizeOfReferenceArray(1)
+                        + ObjectSizes.sizeOfArray(new long[1])
+                        + ObjectSizes.sizeOfArray(new int[1]);
+        long expected = pageStorageFor(1)
+                      + ObjectSizes.sizeOfReferenceArray(1)
+                      - flatArrays
+                      + appended.deletedSlice().start().unsharedHeapSize()
+                      + appended.deletedSlice().end().unsharedHeapSize();
+        assertEquals(expected, fixture.allocator.onHeap().owns() - beforeOwned);
+    }
+
+    @Test
+    public void pagedSnapshotAccountingStaysInSyncAcrossGrowthAndReads()
     {
         Fixture fixture = fixture();
         fixture.add(0);
 
         for (int i = 1; i <= 256; i++)
         {
-            // Force the lazily materialized read cache before the next persistent successor is built. The memtable
-            // delta must charge only newly allocated tree nodes, not charge shared nodes or this read-side cache again.
+            // Reads must not allocate retained state before the next immutable paged successor is built.
             fixture.partition.deletionInfo().rangeCovering(clustering((i - 1) * 2));
             assertDeletionAccountingForNextRange(fixture, i);
         }
     }
 
     @Test
-    public void persistentTreeAccountsEveryRangeInAnOrderedBatch()
+    public void pagedSnapshotFallbackKeepsTheAllocatorInSync()
+    {
+        Fixture fixture = fixture();
+        for (int i = 0; i < 8; i++)
+            fixture.add(i);
+
+        assertDeletionAccounting(fixture, () -> fixture.add(tombstone(-4, -3, 20)));
+    }
+
+    @Test
+    public void pagedSnapshotAccountsEveryRangeInAnOrderedBatch()
     {
         Fixture fixture = fixture();
         fixture.add(0);
 
         assertDeletionAccounting(fixture, () -> fixture.addAll(1, 3));
         assertTimestamps(fixture.partition.deletionInfo().rangeIterator(false), 1, 2, 3, 4);
+    }
+
+    private static long pageStorageFor(int pageCount)
+    {
+        return ObjectSizes.sizeOfReferenceArray(pageCount)
+             + ObjectSizes.measure(new ExpectedPage())
+             + ObjectSizes.sizeOfReferenceArray(64)
+             + ObjectSizes.sizeOfArray(new long[64])
+             + ObjectSizes.sizeOfArray(new int[64]);
     }
 
     private static void assertDeletionAccountingForNextRange(Fixture fixture, int nextRange)
@@ -193,9 +374,7 @@ public class RangeTombstoneListCopyTest
 
         long afterOwned = fixture.allocator.onHeap().owns();
         MutableDeletionInfo afterDeletionInfo = (MutableDeletionInfo) fixture.partition.deletionInfo();
-        long expectedDelta = afterDeletionInfo.memtableUnsharedHeapSize()
-                           - beforeDeletionInfo.memtableUnsharedHeapSize()
-                           + afterDeletionInfo.treeAllocatedOnHeap();
+        long expectedDelta = afterDeletionInfo.unsharedHeapSize() - beforeDeletionInfo.unsharedHeapSize();
         assertEquals(expectedDelta, afterOwned - beforeOwned);
     }
 
@@ -220,6 +399,18 @@ public class RangeTombstoneListCopyTest
         for (int i = firstIndex; i < firstIndex + count; i++)
             deletionInfo.add(tombstone(i * 2, i * 2 + 1, i + 1), comparator);
 
+        BTreePartitionData holder = BTreePartitionData.unsafeConstruct(RegularAndStaticColumns.NONE,
+                                                                        BTree.empty(),
+                                                                        deletionInfo,
+                                                                        Rows.EMPTY_STATIC_ROW,
+                                                                        EncodingStats.NO_STATS);
+        return PartitionUpdate.unsafeConstruct(metadata, key, holder, deletionInfo, false);
+    }
+
+    private static PartitionUpdate update(TableMetadata metadata, DecoratedKey key, RangeTombstone tombstone)
+    {
+        MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
+        deletionInfo.add(tombstone, comparator);
         BTreePartitionData holder = BTreePartitionData.unsafeConstruct(RegularAndStaticColumns.NONE,
                                                                         BTree.empty(),
                                                                         deletionInfo,
@@ -258,6 +449,25 @@ public class RangeTombstoneListCopyTest
         return new RangeTombstone(Slice.make(BufferClusteringBound.inclusiveStartOf(ByteBufferUtil.bytes(start)),
                                              BufferClusteringBound.inclusiveEndOf(ByteBufferUtil.bytes(end))),
                                   DeletionTime.build(timestamp, 1));
+    }
+
+    private static void assertSameDeletionInfo(MutableDeletionInfo expected, MutableDeletionInfo actual)
+    {
+        assertSameTombstones(expected.rangeIterator(false), actual.rangeIterator(false));
+        assertSameTombstones(expected.rangeIterator(true), actual.rangeIterator(true));
+
+        for (int point = -6; point <= 20; point++)
+            assertEquals(expected.rangeCovering(clustering(point)), actual.rangeCovering(clustering(point)));
+
+        for (int start = -6; start <= 20; start++)
+        {
+            for (int end = start; end <= 20; end++)
+            {
+                Slice slice = slice(start, end);
+                assertSameTombstones(expected.rangeIterator(slice, false), actual.rangeIterator(slice, false));
+                assertSameTombstones(expected.rangeIterator(slice, true), actual.rangeIterator(slice, true));
+            }
+        }
     }
 
     private static void assertSameRangeQueries(RangeTombstoneList expected, RangeTombstoneList actual)
@@ -304,6 +514,13 @@ public class RangeTombstoneListCopyTest
         assertFalse(tombstones.hasNext());
     }
 
+    private static final class ExpectedPage
+    {
+        private Object ends;
+        private Object markedAts;
+        private Object delTimesUnsignedIntegers;
+    }
+
     private static final class Fixture
     {
         private final TableMetadata metadata;
@@ -331,6 +548,11 @@ public class RangeTombstoneListCopyTest
         private void add(int index)
         {
             addAll(index, 1);
+        }
+
+        private void add(RangeTombstone range)
+        {
+            partition.addAll(update(metadata, key, range), cloner, writeOp, UpdateTransaction.NO_OP);
         }
 
         private void addAll(int firstIndex, int count)

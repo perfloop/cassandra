@@ -85,16 +85,15 @@ public class MutableDeletionInfo implements DeletionInfo
     }
 
     /**
-     * Copies this deletion info for a memtable merge. Ordered, non-overlapping range updates use an immutable
-     * snapshot so the merge can share unchanged BTree nodes; every other update retains the ordinary flat copy.
+     * Copies this deletion info for a memtable merge. Ordered, non-overlapping range updates retain immutable pages;
+     * all other updates use the ordinary flat copy and mutation path.
      */
     public MutableDeletionInfo mutableCopyForMemtable(DeletionInfo update)
     {
         assert update instanceof MutableDeletionInfo;
         RangeTombstoneList updateRanges = ((MutableDeletionInfo) update).ranges;
-        boolean appendOnly = ranges != null && updateRanges != null && ranges.canAppend(updateRanges);
         return new MutableDeletionInfo(partitionDeletion,
-                                       ranges == null ? null : appendOnly ? ranges.copyForMemtable() : ranges.copy());
+                                       ranges == null ? null : ranges.copyForMemtable(updateRanges));
     }
 
     @Override
@@ -279,8 +278,8 @@ public class MutableDeletionInfo implements DeletionInfo
     }
 
     /**
-     * Heap retained by this deletion info excluding persistent range-tree nodes. Memtable merges account those nodes
-     * incrementally, just as row BTree updates do, because successor snapshots share their unchanged subtrees.
+     * Heap retained by this deletion info excluding immutable paged storage. The updater accounts the paged delta
+     * separately because successive ordered snapshots share all unchanged pages.
      */
     public long memtableUnsharedHeapSize()
     {
@@ -290,12 +289,9 @@ public class MutableDeletionInfo implements DeletionInfo
         return EMPTY_SIZE + partitionDeletion.unsharedHeapSize() + (ranges == null ? 0 : ranges.memtableUnsharedHeapSize());
     }
 
-    /**
-     * Persistent range-tree node bytes allocated while constructing this memtable successor.
-     */
-    public long treeAllocatedOnHeap()
+    public long pageAllocationOnHeap()
     {
-        return ranges == null ? 0 : ranges.treeAllocatedOnHeap();
+        return ranges == null ? 0 : ranges.pageAllocationOnHeap();
     }
 
     public void collectStats(EncodingStats.Collector collector)
