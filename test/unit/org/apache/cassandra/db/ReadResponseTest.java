@@ -27,11 +27,16 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.partitions.SingletonUnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.rows.WrappingUnfilteredRowIterator;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.distributed.test.log.ClusterMetadataTestHelper;
 import org.apache.cassandra.io.util.DataInputBuffer;
@@ -179,7 +184,7 @@ public class ReadResponseTest
 
     }
 
-    private void roundTripSerialization(ReadResponse response, int version)
+    private ReadResponse roundTripSerialization(ReadResponse response, int version)
     {
         try
         {
@@ -192,13 +197,134 @@ public class ReadResponseTest
             assertTrue(deser.mayIncludeRepairedDigest());
             assertEquals(response.repairedDataDigest(), deser.repairedDataDigest());
             assertEquals(response.isRepairedDigestConclusive(), deser.isRepairedDigestConclusive());
+            return deser;
         }
         catch (IOException e)
         {
             fail("Caught unexpected IOException during SerDe: " + e.getMessage());
+            throw new AssertionError(e);
         }
     }
 
+    @Test
+    public void materializesLocalDataBeforeCapturingRepairedDigest()
+    {
+        int key = key();
+        ReadCommand command = command(key, metadata);
+        SourceConsumption sourceConsumption = new SourceConsumption();
+        ByteBuffer repairedDigest = digest();
+        ConsumptionTrackingRepairedDataInfo rdi = new ConsumptionTrackingRepairedDataInfo(repairedDigest, sourceConsumption);
+        PartitionUpdate update = new RowUpdateBuilder(metadata, 1L, key).add("v", 1).buildUpdate();
+
+        ReadResponse response = command.createResponse(trackingPartitions(update, sourceConsumption), rdi);
+
+        assertTrue(sourceConsumption.exhausted);
+        assertTrue(sourceConsumption.closed);
+        assertTrue(rdi.digestCapturedAfterSourceConsumption);
+        assertEquals(repairedDigest, response.repairedDataDigest());
+        assertFalse(response.isRepairedDigestConclusive());
+        assertEquals(1, unfilteredCount(response, command));
+        assertEquals(1, unfilteredCount(response, command));
+
+        ByteBuffer responseDigest = response.digest(command);
+        assertEquals(responseDigest, response.digest(command));
+        for (MessagingService.Version version : MessagingService.Version.supportedVersions())
+        {
+            ReadResponse deserialized = roundTripSerialization(response, version.value);
+            assertEquals(responseDigest, deserialized.digest(command));
+            assertEquals(1, unfilteredCount(deserialized, command));
+        }
+    }
+
+    private static UnfilteredPartitionIterator trackingPartitions(PartitionUpdate update, SourceConsumption sourceConsumption)
+    {
+        UnfilteredRowIterator source = update.unfilteredIterator();
+        UnfilteredRowIterator tracked = new WrappingUnfilteredRowIterator()
+        {
+            public UnfilteredRowIterator wrapped()
+            {
+                return source;
+            }
+
+            public boolean hasNext()
+            {
+                boolean hasNext = source.hasNext();
+                if (!hasNext)
+                    sourceConsumption.exhausted = true;
+                return hasNext;
+            }
+
+            public void close()
+            {
+                try
+                {
+                    source.close();
+                }
+                finally
+                {
+                    sourceConsumption.closed = true;
+                }
+            }
+        };
+        return new SingletonUnfilteredPartitionIterator(tracked);
+    }
+
+    private static int unfilteredCount(ReadResponse response, ReadCommand command)
+    {
+        int count = 0;
+        try (UnfilteredPartitionIterator partitions = response.makeIterator(command))
+        {
+            while (partitions.hasNext())
+            {
+                try (UnfilteredRowIterator partition = partitions.next())
+                {
+                    while (partition.hasNext())
+                    {
+                        partition.next();
+                        count++;
+                    }
+                }
+            }
+        }
+        return count;
+    }
+
+    private static class SourceConsumption
+    {
+        private boolean exhausted;
+        private boolean closed;
+    }
+
+    private static class ConsumptionTrackingRepairedDataInfo extends RepairedDataInfo
+    {
+        private final ByteBuffer repairedDigest;
+        private final SourceConsumption sourceConsumption;
+        private boolean digestCapturedAfterSourceConsumption;
+
+        private ConsumptionTrackingRepairedDataInfo(ByteBuffer repairedDigest, SourceConsumption sourceConsumption)
+        {
+            super(null);
+            this.repairedDigest = repairedDigest;
+            this.sourceConsumption = sourceConsumption;
+        }
+
+        @Override
+        public ByteBuffer getDigest()
+        {
+            if (!sourceConsumption.exhausted || !sourceConsumption.closed)
+                throw new AssertionError("Repaired-data digest captured before source consumption");
+            digestCapturedAfterSourceConsumption = true;
+            return repairedDigest;
+        }
+
+        @Override
+        public boolean isConclusive()
+        {
+            if (!digestCapturedAfterSourceConsumption)
+                throw new AssertionError("Repaired-data conclusiveness captured before source consumption");
+            return false;
+        }
+    }
 
     private int key()
     {
@@ -262,7 +388,7 @@ public class ReadResponseTest
                   RowFilter.none(),
                   DataLimits.NONE,
                   metadata.partitioner.decorateKey(ByteBufferUtil.bytes(key)),
-                  null,
+                  new ClusteringIndexSliceFilter(Slices.ALL, false),
                   null,
                   false,
                   null);

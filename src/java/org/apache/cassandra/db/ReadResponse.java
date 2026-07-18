@@ -20,12 +20,15 @@ package org.apache.cassandra.db;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 
 import com.google.common.annotations.VisibleForTesting;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.partitions.AbstractUnfilteredPartitionIterator;
+import org.apache.cassandra.db.partitions.ImmutableBTreePartition;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
 import org.apache.cassandra.db.rows.DeserializationHelper;
@@ -224,7 +227,8 @@ public abstract class ReadResponse
         }
     }
 
-    // built on the owning node responding to a query
+    // Built on the owning node responding to a query. Coordinator-local reads consume this
+    // representation directly; serialize it only if the response is sent over the network.
     private static class LocalDataResponse extends DataResponse
     {
         // Exponential moving average of response sizes, used to set initial size of output buffer.
@@ -232,17 +236,92 @@ public abstract class ReadResponse
         private static final int bufferInitialSizeMin = CassandraRelevantProperties.DATA_RESPONSE_BUFFER_INITIAL_SIZE_MIN.getInt();
         private static final int bufferInitialSizeMax = CassandraRelevantProperties.DATA_RESPONSE_BUFFER_INITIAL_SIZE_MAX.getInt();
 
+        private final TableMetadata metadata;
+        private final List<ImmutableBTreePartition> partitions;
+        private final ColumnFilter selection;
+        private final boolean isReversed;
+        private volatile ByteBuffer serializedData;
+
         private LocalDataResponse(UnfilteredPartitionIterator iter, ReadCommand command, RepairedDataInfo rdi)
         {
-            super(build(iter, command.columnFilter()),
-                  rdi.getDigest(), rdi.isConclusive(),
-                  MessagingService.current_version,
-                  DeserializationHelper.Flag.LOCAL);
+            // Argument evaluation materializes the iterator before it queries RepairedDataInfo.
+            this(materialize(iter), command.columnFilter(), command.isReversed(), rdi.getDigest(), rdi.isConclusive());
         }
 
         private LocalDataResponse(UnfilteredPartitionIterator iter, ColumnFilter selection)
         {
-            super(build(iter, selection), null, false, MessagingService.current_version, DeserializationHelper.Flag.LOCAL);
+            this(materialize(iter), selection, false, null, false);
+        }
+
+        private LocalDataResponse(MaterializedData data,
+                                  ColumnFilter selection,
+                                  boolean isReversed,
+                                  ByteBuffer repairedDataDigest,
+                                  boolean isRepairedDigestConclusive)
+        {
+            super(null, repairedDataDigest, isRepairedDigestConclusive, MessagingService.current_version, DeserializationHelper.Flag.LOCAL);
+            this.metadata = data.metadata;
+            this.partitions = data.partitions;
+            this.selection = selection;
+            this.isReversed = isReversed;
+        }
+
+        private static MaterializedData materialize(UnfilteredPartitionIterator iter)
+        {
+            List<ImmutableBTreePartition> partitions = new ArrayList<>();
+            while (iter.hasNext())
+            {
+                try (UnfilteredRowIterator partition = iter.next())
+                {
+                    partitions.add(ImmutableBTreePartition.create(partition));
+                }
+            }
+            return new MaterializedData(iter.metadata(), partitions);
+        }
+
+        public UnfilteredPartitionIterator makeIterator(ReadCommand command)
+        {
+            return makeIterator(command.metadata(), command.columnFilter(), command.isReversed());
+        }
+
+        protected ByteBuffer serializedData()
+        {
+            ByteBuffer data = serializedData;
+            if (data == null)
+            {
+                synchronized (this)
+                {
+                    data = serializedData;
+                    if (data == null)
+                    {
+                        data = build(makeIterator(metadata, selection, isReversed), selection);
+                        serializedData = data;
+                    }
+                }
+            }
+            return data;
+        }
+
+        private UnfilteredPartitionIterator makeIterator(TableMetadata metadata, ColumnFilter selection, boolean isReversed)
+        {
+            Iterator<ImmutableBTreePartition> iterator = partitions.iterator();
+            return new AbstractUnfilteredPartitionIterator()
+            {
+                public TableMetadata metadata()
+                {
+                    return metadata;
+                }
+
+                public boolean hasNext()
+                {
+                    return iterator.hasNext();
+                }
+
+                public UnfilteredRowIterator next()
+                {
+                    return iterator.next().unfilteredIterator(selection, Slices.ALL, isReversed);
+                }
+            };
         }
 
         private static ByteBuffer build(UnfilteredPartitionIterator iter, ColumnFilter selection)
@@ -267,6 +346,18 @@ public abstract class ReadResponse
             {
                 // We're serializing in memory so this shouldn't happen
                 throw new RuntimeException(e);
+            }
+        }
+
+        private static class MaterializedData
+        {
+            private final TableMetadata metadata;
+            private final List<ImmutableBTreePartition> partitions;
+
+            private MaterializedData(TableMetadata metadata, List<ImmutableBTreePartition> partitions)
+            {
+                this.metadata = metadata;
+                this.partitions = partitions;
             }
         }
     }
@@ -305,6 +396,11 @@ public abstract class ReadResponse
             this.isRepairedDigestConclusive = isRepairedDigestConclusive;
             this.dataSerializationVersion = dataSerializationVersion;
             this.flag = flag;
+        }
+
+        protected ByteBuffer serializedData()
+        {
+            return data;
         }
 
         public UnfilteredPartitionIterator makeIterator(ReadCommand command)
@@ -378,7 +474,7 @@ public abstract class ReadResponse
                 ByteBufferUtil.writeWithVIntLength(response.repairedDataDigest(), out);
                 out.writeBoolean(response.isRepairedDigestConclusive());
 
-                ByteBuffer data = ((DataResponse)response).data;
+                ByteBuffer data = ((DataResponse)response).serializedData();
                 ByteBufferUtil.writeWithVIntLength(data, out);
             }
         }
@@ -418,7 +514,7 @@ public abstract class ReadResponse
                 // In theory, we should deserialize/re-serialize if the version asked is different from the current
                 // version as the content could have a different serialization format. So far though, we haven't made
                 // change to partition iterators serialization since 3.0 so we skip this.
-                ByteBuffer data = ((DataResponse)response).data;
+                ByteBuffer data = ((DataResponse)response).serializedData();
                 size += ByteBufferUtil.serializedSizeWithVIntLength(data);
             }
             return size;
