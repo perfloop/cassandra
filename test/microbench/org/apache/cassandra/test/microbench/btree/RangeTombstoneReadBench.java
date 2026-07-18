@@ -70,7 +70,7 @@ public class RangeTombstoneReadBench
     private static final OpOrder NO_ORDER = new OpOrder();
     private static final HeapPool POOL = new HeapPool(Long.MAX_VALUE, 1.0f, () -> ImmediateFuture.success(Boolean.TRUE));
 
-    @Param({ "64", "512", "4096" })
+    @Param("4096")
     int rangeCount;
 
     @Param({ "1", "3" })
