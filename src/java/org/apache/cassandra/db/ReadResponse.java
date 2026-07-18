@@ -26,14 +26,19 @@ import java.util.List;
 import com.google.common.annotations.VisibleForTesting;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.db.context.CounterContext;
 import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
 import org.apache.cassandra.db.partitions.AbstractUnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.ImmutableBTreePartition;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.DeserializationHelper;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataInputPlus;
@@ -59,6 +64,11 @@ public abstract class ReadResponse
     public static ReadResponse createDataResponse(UnfilteredPartitionIterator data, ReadCommand command, RepairedDataInfo rdi)
     {
         return new LocalDataResponse(data, command, rdi);
+    }
+
+    static ReadResponse createDataResponseForRemote(UnfilteredPartitionIterator data, ReadCommand command, RepairedDataInfo rdi)
+    {
+        return new SerializedDataResponse(data, command, rdi);
     }
 
     public static ReadResponse createDataResponse(UnfilteredPartitionIterator data, ReadCommand command)
@@ -273,10 +283,59 @@ public abstract class ReadResponse
             {
                 try (UnfilteredRowIterator partition = iter.next())
                 {
-                    partitions.add(ImmutableBTreePartition.create(partition));
+                    partitions.add(ImmutableBTreePartition.create(clearLocalCounterContexts(partition)));
                 }
             }
             return new MaterializedData(iter.metadata(), partitions);
+        }
+
+        private static UnfilteredRowIterator clearLocalCounterContexts(UnfilteredRowIterator partition)
+        {
+            if (!partition.metadata().isCounter())
+                return partition;
+
+            return Transformation.apply(partition, new Transformation<UnfilteredRowIterator>()
+            {
+                @Override
+                public Row applyToStatic(Row row)
+                {
+                    return clearLocalCounterContexts(row);
+                }
+
+                @Override
+                public Row applyToRow(Row row)
+                {
+                    return clearLocalCounterContexts(row);
+                }
+            });
+        }
+
+        private static Row clearLocalCounterContexts(Row row)
+        {
+            for (Cell<?> cell : row.cells())
+            {
+                if (hasMarkedLocalCounterContext(cell))
+                    return row.transformAndFilter(columnData -> columnData instanceof Cell
+                                                                  ? clearLocalCounterContext((Cell<?>) columnData)
+                                                                  : columnData);
+            }
+            return row;
+        }
+
+        private static Cell<?> clearLocalCounterContext(Cell<?> cell)
+        {
+            if (!hasMarkedLocalCounterContext(cell))
+                return cell;
+
+            ByteBuffer value = cell.buffer();
+            return cell.withUpdatedValue(CounterContext.instance().clearAllLocal(value, ByteBufferAccessor.instance));
+        }
+
+        private static boolean hasMarkedLocalCounterContext(Cell<?> cell)
+        {
+            return cell.isCounterCell()
+                   && cell.localDeletionTime() == Cell.NO_DELETION_TIME
+                   && CounterContext.instance().shouldClearLocal(cell.buffer(), ByteBufferAccessor.instance);
         }
 
         public UnfilteredPartitionIterator makeIterator(ReadCommand command)
@@ -359,6 +418,18 @@ public abstract class ReadResponse
                 this.metadata = metadata;
                 this.partitions = partitions;
             }
+        }
+    }
+
+    // Built on the owning node when the response will be sent to a remote coordinator.
+    private static class SerializedDataResponse extends DataResponse
+    {
+        private SerializedDataResponse(UnfilteredPartitionIterator iter, ReadCommand command, RepairedDataInfo rdi)
+        {
+            super(LocalDataResponse.build(iter, command.columnFilter()),
+                  rdi.getDigest(), rdi.isConclusive(),
+                  MessagingService.current_version,
+                  DeserializationHelper.Flag.LOCAL);
         }
     }
 

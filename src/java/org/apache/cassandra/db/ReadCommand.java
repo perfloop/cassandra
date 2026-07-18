@@ -437,12 +437,26 @@ public abstract class ReadCommand extends AbstractReadQuery
 
     public ReadResponse createResponse(UnfilteredPartitionIterator iterator, RepairedDataInfo rdi)
     {
+        return createResponse(iterator, rdi, false);
+    }
+
+    // Remote replicas send their response over the wire rather than replaying it on this coordinator.
+    ReadResponse createResponseForRemote(UnfilteredPartitionIterator iterator, RepairedDataInfo rdi)
+    {
+        return createResponse(iterator, rdi, true);
+    }
+
+    private ReadResponse createResponse(UnfilteredPartitionIterator iterator, RepairedDataInfo rdi, boolean isForRemote)
+    {
         // validate that the sequence of RT markers is correct: open is followed by close, deletion times for both
         // ends equal, and there are no dangling RT bound in any partition.
         iterator = RTBoundValidator.validate(iterator, Stage.PROCESSED, true);
 
-        return isDigestQuery()
-               ? ReadResponse.createDigestResponse(iterator, this)
+        if (isDigestQuery())
+            return ReadResponse.createDigestResponse(iterator, this);
+
+        return isForRemote
+               ? ReadResponse.createDataResponseForRemote(iterator, this, rdi)
                : ReadResponse.createDataResponse(iterator, this, rdi);
     }
 

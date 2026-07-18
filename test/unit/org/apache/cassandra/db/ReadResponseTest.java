@@ -20,6 +20,10 @@ package org.apache.cassandra.db;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.EnumSet;
+import java.util.List;
 import java.util.Random;
 
 import org.junit.Before;
@@ -27,14 +31,19 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.context.CounterContext;
 import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.CounterColumnType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.partitions.SingletonUnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.rows.WrappingUnfilteredRowIterator;
 import org.apache.cassandra.dht.Murmur3Partitioner;
@@ -236,6 +245,53 @@ public class ReadResponseTest
         }
     }
 
+    @Test
+    public void clearsMarkedLocalCounterContextsInMaterializedResponse()
+    {
+        TableMetadata counterMetadata = counterMetadata();
+        int key = key();
+        ReadCommand command = command(key, counterMetadata);
+        ByteBuffer marked = CounterContext.instance().markLocalToBeCleared(CounterContext.instance().createLocal(1));
+        assertTrue(CounterContext.instance().shouldClearLocal(marked, ByteBufferAccessor.instance));
+        PartitionUpdate update = new RowUpdateBuilder(counterMetadata, 1L, key).add("c", marked).buildUpdate();
+
+        ReadResponse response = command.createResponse(new SingletonUnfilteredPartitionIterator(update.unfilteredIterator()), RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO);
+
+        ByteBuffer cleared = clearedCounterContext(response, command);
+        assertEquals(cleared, clearedCounterContext(response, command));
+        for (MessagingService.Version version : MessagingService.Version.supportedVersions())
+            assertEquals(cleared, clearedCounterContext(roundTripSerialization(response, version.value), command));
+
+        PartitionUpdate remoteUpdate = new RowUpdateBuilder(counterMetadata, 1L, key).add("c", marked).buildUpdate();
+        ReadResponse remoteResponse = command.createResponseForRemote(new SingletonUnfilteredPartitionIterator(remoteUpdate.unfilteredIterator()), RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO);
+        assertEquals(cleared, clearedCounterContext(remoteResponse, command));
+    }
+
+    @Test
+    public void mergedLocalDataResponseReplaysMultiplePartitions()
+    {
+        int first = 1;
+        int second = 2;
+        if (metadata.partitioner.decorateKey(ByteBufferUtil.bytes(first)).compareTo(metadata.partitioner.decorateKey(ByteBufferUtil.bytes(second))) > 0)
+        {
+            int swap = first;
+            first = second;
+            second = swap;
+        }
+
+        ReadCommand command = command(first, metadata);
+        ReadResponse firstResponse = command.createResponse(new SingletonUnfilteredPartitionIterator(update(metadata, first).unfilteredIterator()), RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO);
+        ReadResponse secondResponse = command.createResponse(new SingletonUnfilteredPartitionIterator(update(metadata, second).unfilteredIterator()), RepairedDataInfo.NO_OP_REPAIRED_DATA_INFO);
+        ReadResponse merged = ReadResponse.merge(Arrays.asList(firstResponse, secondResponse), command);
+        List<ByteBuffer> expectedKeys = Arrays.asList(ByteBufferUtil.bytes(first), ByteBufferUtil.bytes(second));
+        List<List<Integer>> expectedRows = Arrays.asList(Arrays.asList(first), Arrays.asList(second));
+
+        assertPartitionContents(merged, command, expectedKeys, expectedRows);
+        assertPartitionContents(merged, command, expectedKeys, expectedRows);
+        for (MessagingService.Version version : MessagingService.Version.supportedVersions())
+            assertPartitionContents(roundTripSerialization(merged, version.value), command, expectedKeys, expectedRows);
+    }
+
     private static UnfilteredPartitionIterator trackingPartitions(PartitionUpdate update, SourceConsumption sourceConsumption)
     {
         UnfilteredRowIterator source = update.unfilteredIterator();
@@ -287,6 +343,75 @@ public class ReadResponseTest
             }
         }
         return count;
+    }
+
+    private static ByteBuffer clearedCounterContext(ReadResponse response, ReadCommand command)
+    {
+        Cell<?> cell = onlyCell(response, command);
+        assertFalse(CounterContext.instance().shouldClearLocal(cell.buffer(), ByteBufferAccessor.instance));
+        assertEquals(1, CounterContext.instance().total(cell));
+        return cell.buffer();
+    }
+
+    private static Cell<?> onlyCell(ReadResponse response, ReadCommand command)
+    {
+        try (UnfilteredPartitionIterator partitions = response.makeIterator(command))
+        {
+            assertTrue(partitions.hasNext());
+            try (UnfilteredRowIterator partition = partitions.next())
+            {
+                assertTrue(partition.hasNext());
+                Row row = (Row) partition.next();
+                for (Cell<?> cell : row.cells())
+                    return cell;
+            }
+        }
+        throw new AssertionError("Expected a cell");
+    }
+
+    private static void assertPartitionContents(ReadResponse response,
+                                                ReadCommand command,
+                                                List<ByteBuffer> expectedKeys,
+                                                List<List<Integer>> expectedRows)
+    {
+        List<ByteBuffer> keys = new ArrayList<>();
+        List<List<Integer>> rows = new ArrayList<>();
+        try (UnfilteredPartitionIterator partitions = response.makeIterator(command))
+        {
+            while (partitions.hasNext())
+            {
+                try (UnfilteredRowIterator partition = partitions.next())
+                {
+                    keys.add(partition.partitionKey().getKey());
+                    List<Integer> values = new ArrayList<>();
+                    while (partition.hasNext())
+                    {
+                        Row row = (Row) partition.next();
+                        Cell<?> cell = row.cells().iterator().next();
+                        values.add(Int32Type.instance.compose(cell.buffer()));
+                    }
+                    rows.add(values);
+                }
+            }
+        }
+        assertEquals(expectedKeys, keys);
+        assertEquals(expectedRows, rows);
+    }
+
+    private static PartitionUpdate update(TableMetadata metadata, int key)
+    {
+        return new RowUpdateBuilder(metadata, 1L, key).add("v", key).buildUpdate();
+    }
+
+    private TableMetadata counterMetadata()
+    {
+        return TableMetadata.builder("ks", "counter")
+                            .flags(EnumSet.of(TableMetadata.Flag.COUNTER, TableMetadata.Flag.COMPOUND))
+                            .offline()
+                            .addPartitionKeyColumn("p", Int32Type.instance)
+                            .addRegularColumn("c", CounterColumnType.instance)
+                            .partitioner(Murmur3Partitioner.instance)
+                            .build();
     }
 
     private static class SourceConsumption

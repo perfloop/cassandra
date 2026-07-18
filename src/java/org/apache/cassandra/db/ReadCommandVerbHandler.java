@@ -59,7 +59,7 @@ public class ReadCommandVerbHandler implements IVerbHandler<ReadCommand>
         try (ReadExecutionController controller = command.executionController(trackRepairedData);
              UnfilteredPartitionIterator iterator = command.executeLocally(controller))
         {
-            response = command.createResponse(iterator, controller.getRepairedDataInfo());
+            response = command.createResponseForRemote(iterator, controller.getRepairedDataInfo());
         }
 
         return response;

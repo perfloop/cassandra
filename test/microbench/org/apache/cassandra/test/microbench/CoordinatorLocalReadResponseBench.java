@@ -21,25 +21,17 @@ package org.apache.cassandra.test.microbench;
 import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.TimeUnit;
 
 import com.sun.management.ThreadMXBean;
 
 import org.openjdk.jmh.annotations.AuxCounters;
 import org.openjdk.jmh.annotations.Benchmark;
-import org.openjdk.jmh.annotations.BenchmarkMode;
-import org.openjdk.jmh.annotations.Fork;
 import org.openjdk.jmh.annotations.Level;
-import org.openjdk.jmh.annotations.Measurement;
-import org.openjdk.jmh.annotations.Mode;
-import org.openjdk.jmh.annotations.OutputTimeUnit;
-import org.openjdk.jmh.annotations.Param;
 import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Threads;
-import org.openjdk.jmh.annotations.Warmup;
 
 import org.apache.cassandra.concurrent.ExecutorPlus;
 import org.apache.cassandra.concurrent.ImmediateExecutor;
@@ -56,21 +48,14 @@ import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.utils.TestHelper;
 
-@BenchmarkMode(Mode.AverageTime)
-@OutputTimeUnit(TimeUnit.NANOSECONDS)
-@Warmup(iterations = 3, time = 1, timeUnit = TimeUnit.SECONDS)
-@Measurement(iterations = 1, time = 1, timeUnit = TimeUnit.SECONDS)
-@Fork(1)
 @Threads(1)
 @State(Scope.Benchmark)
 public class CoordinatorLocalReadResponseBench extends CQLTester
 {
     private static final int COLUMNS = 4;
+    private static final int ROW_COUNT = 100;
     private static final long CHECKSUM_SEED = 1_125_899_906_842_597L;
     private static final ThreadMXBean THREADS = (ThreadMXBean) ManagementFactory.getThreadMXBean();
-
-    @Param({ "100" })
-    public int rowCount;
 
     private SinglePartitionReadCommand template;
     private long expectedChecksum;
@@ -85,7 +70,7 @@ public class CoordinatorLocalReadResponseBench extends CQLTester
         String table = createTable(keyspace, "CREATE TABLE %s (pk int, ck int, v0 text, v1 text, v2 text, v3 text, PRIMARY KEY (pk, ck))");
         String statement = "INSERT INTO " + keyspace + '.' + table + " (pk, ck, v0, v1, v2, v3) VALUES (?, ?, ?, ?, ?, ?)";
 
-        for (int row = 0; row < rowCount; row++)
+        for (int row = 0; row < ROW_COUNT; row++)
         {
             executeInternal(statement,
                             0,
@@ -151,7 +136,7 @@ public class CoordinatorLocalReadResponseBench extends CQLTester
                 }
             }
 
-            if (rows != rowCount || cells != rowCount * COLUMNS || checksum != expectedChecksum)
+            if (rows != ROW_COUNT || cells != ROW_COUNT * COLUMNS || checksum != expectedChecksum)
                 throw new AssertionError("Unexpected coordinator read result");
         }
         allocation.threadAllocatedBytes += THREADS.getThreadAllocatedBytes(allocation.threadId) - allocatedBefore;
@@ -190,7 +175,7 @@ public class CoordinatorLocalReadResponseBench extends CQLTester
     private long expectedChecksum()
     {
         long checksum = CHECKSUM_SEED;
-        for (int row = 0; row < rowCount; row++)
+        for (int row = 0; row < ROW_COUNT; row++)
         {
             for (int column = 0; column < COLUMNS; column++)
                 checksum = updateChecksum(checksum, value(row, column).getBytes(StandardCharsets.UTF_8));
