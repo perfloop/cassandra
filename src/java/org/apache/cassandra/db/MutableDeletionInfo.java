@@ -20,8 +20,6 @@ package org.apache.cassandra.db;
 import java.util.Collections;
 import java.util.Iterator;
 
-import com.google.common.base.Objects;
-
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.RangeTombstoneMarker;
@@ -130,18 +128,31 @@ public class MutableDeletionInfo implements DeletionInfo
      */
     public DeletionInfo add(DeletionInfo newInfo)
     {
-        add(newInfo.getPartitionDeletion());
+        if (newInfo instanceof MutableDeletionInfo)
+        {
+            add(newInfo.getPartitionDeletion());
+            RangeTombstoneList newRanges = ((MutableDeletionInfo) newInfo).ranges;
+            if (ranges == null)
+                ranges = newRanges == null ? null : newRanges.copy();
+            else if (newRanges != null)
+                ranges.addAll(newRanges);
+            return this;
+        }
 
-        // We know MutableDeletionInfo is the only impelementation and we're not mutating it, it's just to get access to the
-        // RangeTombstoneList directly.
-        assert newInfo instanceof MutableDeletionInfo;
-        RangeTombstoneList newRanges = ((MutableDeletionInfo)newInfo).ranges;
+        if (!(newInfo instanceof ImmutableDeletionInfo))
+            throw new IllegalArgumentException("Unsupported deletion info type: " + newInfo.getClass());
 
-        if (ranges == null)
-            ranges = newRanges == null ? null : newRanges.copy();
-        else if (newRanges != null)
-            ranges.addAll(newRanges);
+        ImmutableDeletionInfo immutable = (ImmutableDeletionInfo) newInfo;
+        ClusteringComparator comparator = immutable.clusteringComparator();
+        if (ranges != null && ranges.isEmpty())
+            ranges = null;
+        else if (ranges != null && !ranges.comparator().equals(comparator))
+            throw new IllegalArgumentException("Cannot combine ranges with a different clustering comparator");
 
+        add(immutable.getPartitionDeletion());
+        Iterator<RangeTombstone> iterator = immutable.rangeIterator(false);
+        while (iterator.hasNext())
+            add(iterator.next(), comparator);
         return this;
     }
 
@@ -175,6 +186,11 @@ public class MutableDeletionInfo implements DeletionInfo
     public boolean hasRanges()
     {
         return ranges != null && !ranges.isEmpty();
+    }
+
+    ClusteringComparator clusteringComparator()
+    {
+        return ranges == null ? null : ranges.comparator();
     }
 
     public int rangeCount()
@@ -244,16 +260,37 @@ public class MutableDeletionInfo implements DeletionInfo
     @Override
     public boolean equals(Object o)
     {
-        if(!(o instanceof MutableDeletionInfo))
+        if (!(o instanceof DeletionInfo))
             return false;
-        MutableDeletionInfo that = (MutableDeletionInfo)o;
-        return partitionDeletion.equals(that.partitionDeletion) && Objects.equal(ranges, that.ranges);
+
+        DeletionInfo that = (DeletionInfo) o;
+        if (!partitionDeletion.equals(that.getPartitionDeletion()))
+            return false;
+
+        Iterator<RangeTombstone> left = rangeIterator(false);
+        Iterator<RangeTombstone> right = that.rangeIterator(false);
+        while (left.hasNext() && right.hasNext())
+        {
+            if (!left.next().equals(right.next()))
+                return false;
+        }
+        return !left.hasNext() && !right.hasNext();
     }
 
     @Override
     public final int hashCode()
     {
-        return Objects.hashCode(partitionDeletion, ranges);
+        int rangesHash = rangeCount();
+        Iterator<RangeTombstone> iterator = rangeIterator(false);
+        while (iterator.hasNext())
+        {
+            RangeTombstone range = iterator.next();
+            DeletionTime deletion = range.deletionTime();
+            rangesHash += range.deletedSlice().start().hashCode() + range.deletedSlice().end().hashCode();
+            rangesHash += (int) (deletion.markedForDeleteAt() ^ (deletion.markedForDeleteAt() >>> 32));
+            rangesHash += deletion.localDeletionTimeUnsignedInteger();
+        }
+        return 31 * (31 + partitionDeletion.hashCode()) + rangesHash;
     }
 
     @Override
