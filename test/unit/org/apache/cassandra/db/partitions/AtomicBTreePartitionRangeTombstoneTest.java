@@ -66,6 +66,7 @@ public class AtomicBTreePartitionRangeTombstoneTest
     @BeforeClass
     public static void setup()
     {
+        DatabaseDescriptor.daemonInitialization();
         DatabaseDescriptor.setPartitionerUnsafe(ByteOrderedPartitioner.instance);
         metadata = TableMetadata.builder("range_tombstone_test", "atomic_partition")
                                 .addPartitionKeyColumn("pk", Int32Type.instance)
