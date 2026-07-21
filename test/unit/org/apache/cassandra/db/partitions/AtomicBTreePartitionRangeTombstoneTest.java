@@ -42,7 +42,6 @@ import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
-import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.HeapCloner;
@@ -53,6 +52,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 
 public class AtomicBTreePartitionRangeTombstoneTest
 {
@@ -209,11 +209,18 @@ public class AtomicBTreePartitionRangeTombstoneTest
 
     private static void assertRangeOnlyAccounting(State state)
     {
+        BTreePartitionData empty = BTreePartitionData.unsafeGetEmpty();
         BTreePartitionData holder = state.partition.unsafeGetHolder();
-        long expected = holder.deletionInfo.unsharedHeapSize()
-                        + holder.columns.unsharedHeapSize()
-                        + BTree.sizeOnHeapOf(holder.tree)
-                        + holder.stats.unsharedHeapSize();
+
+        // AtomicBTreePartition.Updater starts from the shared empty holder and calls
+        // makeMergedPartition directly. The memtable accounts the holder separately,
+        // so this allocator contains only the updater's component deltas.
+        assertSame(empty.columns, holder.columns);
+        assertSame(empty.staticRow, holder.staticRow);
+        assertSame(empty.tree, holder.tree);
+
+        long expected = holder.deletionInfo.unsharedHeapSize() - empty.deletionInfo.unsharedHeapSize()
+                        + holder.stats.unsharedHeapSize() - empty.stats.unsharedHeapSize();
         assertEquals(expected, state.allocator.onHeap().owns());
     }
 
