@@ -138,7 +138,7 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
         return merge(current, update);
     }
 
-    private DeletionInfo merge(DeletionInfo existing, DeletionInfo update)
+    protected DeletionInfo merge(DeletionInfo existing, DeletionInfo update)
     {
         if (update.isLive() || !update.mayModify(existing))
             return existing;
@@ -149,6 +149,15 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
         if (update.hasRanges())
             update.rangeIterator(false).forEachRemaining(indexer::onRangeTombstone);
 
+        return mergeDeletionInfo(existing, update);
+    }
+
+    /**
+     * Merges deletion information and records the retained-heap delta.  Atomic partitions override this
+     * for their immutable ordered-append representation; all other callers retain the canonical mutable path.
+     */
+    protected DeletionInfo mergeDeletionInfo(DeletionInfo existing, DeletionInfo update)
+    {
         // Like for rows, we have to clone the update in case internal buffers (when it has range tombstones) reference
         // memory we shouldn't hold into. But we don't ever store this off-heap currently so we just default to the
         // HeapAllocator (rather than using 'allocator').

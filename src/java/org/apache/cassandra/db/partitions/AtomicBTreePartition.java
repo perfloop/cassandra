@@ -148,6 +148,18 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
             super(allocator, cloner, writeOp, indexer);
         }
 
+        @Override
+        protected DeletionInfo mergeDeletionInfo(DeletionInfo existing, DeletionInfo update)
+        {
+            if (ImmutableBTreeDeletionInfo.canAppend(existing, update, metadata().comparator))
+                return ImmutableBTreeDeletionInfo.append(existing, update, metadata().comparator, this);
+
+            if (existing instanceof ImmutableBTreeDeletionInfo && !update.hasRanges())
+                return ((ImmutableBTreeDeletionInfo) existing).withPartitionDeletion(update.getPartitionDeletion(), this);
+
+            return super.mergeDeletionInfo(existing, update);
+        }
+
         Updater addAll(final PartitionUpdate update)
         {
             try

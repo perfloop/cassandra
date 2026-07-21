@@ -132,10 +132,13 @@ public class MutableDeletionInfo implements DeletionInfo
     {
         add(newInfo.getPartitionDeletion());
 
-        // We know MutableDeletionInfo is the only impelementation and we're not mutating it, it's just to get access to the
-        // RangeTombstoneList directly.
-        assert newInfo instanceof MutableDeletionInfo;
-        RangeTombstoneList newRanges = ((MutableDeletionInfo)newInfo).ranges;
+        // The immutable AtomicBTreePartition representation owns a BTree rather than a RangeTombstoneList.
+        // Materialize it at this canonical reconciliation boundary instead of teaching mutable range merging a
+        // second representation.
+        if (!(newInfo instanceof MutableDeletionInfo))
+            newInfo = newInfo.mutableCopy();
+
+        RangeTombstoneList newRanges = ((MutableDeletionInfo) newInfo).ranges;
 
         if (ranges == null)
             ranges = newRanges == null ? null : newRanges.copy();
@@ -244,10 +247,21 @@ public class MutableDeletionInfo implements DeletionInfo
     @Override
     public boolean equals(Object o)
     {
-        if(!(o instanceof MutableDeletionInfo))
+        if (!(o instanceof DeletionInfo))
             return false;
-        MutableDeletionInfo that = (MutableDeletionInfo)o;
-        return partitionDeletion.equals(that.partitionDeletion) && Objects.equal(ranges, that.ranges);
+
+        DeletionInfo that = (DeletionInfo) o;
+        if (!partitionDeletion.equals(that.getPartitionDeletion()))
+            return false;
+
+        Iterator<RangeTombstone> left = rangeIterator(false);
+        Iterator<RangeTombstone> right = that.rangeIterator(false);
+        while (left.hasNext() && right.hasNext())
+        {
+            if (!left.next().equals(right.next()))
+                return false;
+        }
+        return !left.hasNext() && !right.hasNext();
     }
 
     @Override

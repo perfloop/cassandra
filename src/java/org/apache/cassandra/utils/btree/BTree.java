@@ -2323,6 +2323,51 @@ public class BTree
         return size;
     }
 
+    /**
+     * Returns the retained-heap change for a rightmost append to an immutable BTree.  Unchanged prefix
+     * subtrees are compared by identity, so the calculation follows only the copied path rather than
+     * rescanning the whole tree on every append.
+     */
+    public static long sizeOnHeapDeltaForAppend(Object[] previous, Object[] updated)
+    {
+        if (previous == updated)
+            return 0;
+
+        if (isEmpty(previous) || isEmpty(updated) || depth(previous) != depth(updated)
+            || isLeaf(previous) || isLeaf(updated))
+            return sizeOnHeapOf(updated) - sizeOnHeapOf(previous);
+
+        long delta = nodeSizeOnHeap(updated) - nodeSizeOnHeap(previous);
+        int previousChild = getChildStart(previous);
+        int updatedChild = getChildStart(updated);
+        int previousEnd = getChildEnd(previous);
+        int updatedEnd = getChildEnd(updated);
+
+        while (previousChild < previousEnd && updatedChild < updatedEnd
+               && previous[previousChild] == updated[updatedChild])
+        {
+            previousChild++;
+            updatedChild++;
+        }
+
+        if (previousChild < previousEnd && updatedChild < updatedEnd)
+        {
+            delta += sizeOnHeapDeltaForAppend((Object[]) previous[previousChild++], (Object[]) updated[updatedChild++]);
+        }
+
+        while (previousChild < previousEnd)
+            delta -= sizeOnHeapOf((Object[]) previous[previousChild++]);
+        while (updatedChild < updatedEnd)
+            delta += sizeOnHeapOf((Object[]) updated[updatedChild++]);
+
+        return delta;
+    }
+
+    private static long nodeSizeOnHeap(Object[] node)
+    {
+        return ObjectSizes.sizeOfArray(node) + ObjectSizes.sizeOfArray(sizeMap(node));
+    }
+
     private static long sizeOnHeapOfLeaf(Object[] tree)
     {
         if (isEmpty(tree))
