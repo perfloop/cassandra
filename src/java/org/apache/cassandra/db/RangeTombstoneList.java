@@ -113,6 +113,25 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>, IMeasurable
                                       boundaryHeapSize, size);
     }
 
+    /** Builds exact-capacity arrays from ranges already canonicalized by this list's merge semantics. */
+    static RangeTombstoneList fromCanonicalRanges(ClusteringComparator comparator,
+                                                  RangeTombstone[] ranges,
+                                                  long boundaryHeapSize)
+    {
+        RangeTombstoneList copy = new RangeTombstoneList(comparator, ranges.length);
+        for (int i = 0; i < ranges.length; i++)
+        {
+            RangeTombstone range = ranges[i];
+            copy.starts[i] = range.deletedSlice().start();
+            copy.ends[i] = range.deletedSlice().end();
+            copy.markedAts[i] = range.deletionTime().markedForDeleteAt();
+            copy.delTimesUnsignedIntegers[i] = range.deletionTime().localDeletionTimeUnsignedInteger();
+        }
+        copy.size = ranges.length;
+        copy.boundaryHeapSize = boundaryHeapSize;
+        return copy;
+    }
+
     public RangeTombstoneList clone(ByteBufferCloner cloner)
     {
         RangeTombstoneList copy =  new RangeTombstoneList(comparator,

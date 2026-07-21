@@ -39,7 +39,7 @@ import org.apache.cassandra.utils.memory.HeapCloner;
  */
 public final class ImmutableDeletionInfo implements DeletionInfo
 {
-    private static final long EMPTY_SIZE = ObjectSizes.measure(new ImmutableDeletionInfo(DeletionTime.LIVE, null, new RangeComparator(null), BTree.empty(), 0));
+    private static final long EMPTY_SIZE = ObjectSizes.measure(new ImmutableDeletionInfo(DeletionTime.LIVE, null, new RangeComparator(null), BTree.empty(), 0, 0));
     private static final long RANGE_COMPARATOR_SIZE = ObjectSizes.measure(new RangeComparator(null));
     private static final long RANGE_TOMBSTONE_SIZE = ObjectSizes.measure(new RangeTombstone(Slice.ALL, DeletionTime.LIVE));
     private static final long SLICE_SIZE = ObjectSizes.measure(Slice.ALL);
@@ -49,52 +49,56 @@ public final class ImmutableDeletionInfo implements DeletionInfo
     private final RangeComparator rangeComparator;
     private final Object[] ranges;
     private final long rangeHeapSize;
+    private final long rangeBoundaryHeapSize;
 
     private ImmutableDeletionInfo(DeletionTime partitionDeletion,
                                   ClusteringComparator clusteringComparator,
                                   RangeComparator rangeComparator,
                                   Object[] ranges,
-                                  long rangeHeapSize)
+                                  long rangeHeapSize,
+                                  long rangeBoundaryHeapSize)
     {
         this.partitionDeletion = partitionDeletion;
         this.clusteringComparator = clusteringComparator;
         this.rangeComparator = rangeComparator;
         this.ranges = ranges;
         this.rangeHeapSize = rangeHeapSize;
+        this.rangeBoundaryHeapSize = rangeBoundaryHeapSize;
     }
 
     /**
-     * Builds an immutable tree from a canonical mutable result.  The source must be a supported
-     * deletion-info implementation with ranges; all retained bounds are cloned before publication.
-     * Callers must use {@link MutableDeletionInfo} to reconcile ranges before invoking this method.
+     * Builds an immutable tree from a canonical mutable update. The source partition deletion and the
+     * previously published partition deletion are reconciled here, so callers cannot supply a second,
+     * competing partition-deletion authority. All retained bounds are cloned before publication.
      */
-    public static ImmutableDeletionInfo copyOf(DeletionInfo deletionInfo,
-                                                DeletionTime partitionDeletion,
+    public static ImmutableDeletionInfo copyOf(MutableDeletionInfo source,
+                                                DeletionTime priorPartitionDeletion,
                                                 UpdateFunction<?, ?> allocationListener)
     {
-        ClusteringComparator clusteringComparator = sourceComparator(deletionInfo);
+        ClusteringComparator clusteringComparator = source.clusteringComparator();
         if (clusteringComparator == null)
             throw new IllegalArgumentException("Cannot build immutable deletion info without range tombstones");
 
+        DeletionTime sourcePartitionDeletion = source.getPartitionDeletion();
+        DeletionTime partitionDeletion = sourcePartitionDeletion.supersedes(priorPartitionDeletion)
+                                        ? sourcePartitionDeletion
+                                        : priorPartitionDeletion;
         DeletionTime ownedPartitionDeletion = copyDeletionTime(partitionDeletion);
         RangeComparator rangeComparator = new RangeComparator(clusteringComparator);
         RangeTreeUpdater updater = new RangeTreeUpdater(allocationListener);
-        Object[] ranges = BTree.empty();
-        Iterator<RangeTombstone> iterator = deletionInfo.rangeIterator(false);
-        while (iterator.hasNext())
-            ranges = BTree.update(ranges, BTree.singleton(clone(iterator.next(), HeapCloner.instance)), rangeComparator, updater);
+        Object[] ranges = appendCopiedRanges(BTree.empty(), source, rangeComparator, updater);
 
         allocationListener.onAllocatedOnHeap(EMPTY_SIZE + RANGE_COMPARATOR_SIZE + ownedPartitionDeletion.unsharedHeapSize());
-        return new ImmutableDeletionInfo(ownedPartitionDeletion, clusteringComparator, rangeComparator, ranges, updater.rangeHeapSize);
+        return new ImmutableDeletionInfo(ownedPartitionDeletion, clusteringComparator, rangeComparator, ranges, updater.rangeHeapSize, updater.rangeBoundaryHeapSize);
     }
 
     /**
      * Appends a canonical, disjoint update using BTree's persistent update path.  Range bounds are
      * cloned before publication. A null result tells the caller to materialize through MutableDeletionInfo instead.
      */
-    public ImmutableDeletionInfo tryAppend(DeletionInfo update, UpdateFunction<?, ?> allocationListener)
+    public ImmutableDeletionInfo tryAppend(MutableDeletionInfo update, UpdateFunction<?, ?> allocationListener)
     {
-        if (update.hasRanges() && !clusteringComparator.equals(sourceComparator(update)))
+        if (update.hasRanges() && !clusteringComparator.equals(update.clusteringComparator()))
             throw new IllegalArgumentException("Cannot append ranges with a different clustering comparator");
 
         DeletionTime newPartitionDeletion = update.getPartitionDeletion().supersedes(partitionDeletion)
@@ -107,26 +111,23 @@ public final class ImmutableDeletionInfo implements DeletionInfo
                 return this;
 
             allocationListener.onAllocatedOnHeap(EMPTY_SIZE + newPartitionDeletion.unsharedHeapSize());
-            return new ImmutableDeletionInfo(newPartitionDeletion, clusteringComparator, rangeComparator, ranges, rangeHeapSize);
+            return new ImmutableDeletionInfo(newPartitionDeletion, clusteringComparator, rangeComparator, ranges, rangeHeapSize, rangeBoundaryHeapSize);
         }
 
         if (!canAppend(update))
             return null;
 
         RangeTreeUpdater updater = new RangeTreeUpdater(allocationListener);
-        Object[] newRanges = ranges;
-        Iterator<RangeTombstone> iterator = update.rangeIterator(false);
-        while (iterator.hasNext())
-            newRanges = BTree.update(newRanges, BTree.singleton(clone(iterator.next(), HeapCloner.instance)), rangeComparator, updater);
+        Object[] newRanges = appendCopiedRanges(ranges, update, rangeComparator, updater);
 
         allocationListener.onAllocatedOnHeap(EMPTY_SIZE);
         if (newPartitionDeletion != partitionDeletion)
             allocationListener.onAllocatedOnHeap(newPartitionDeletion.unsharedHeapSize());
 
-        return new ImmutableDeletionInfo(newPartitionDeletion, clusteringComparator, rangeComparator, newRanges, rangeHeapSize + updater.rangeHeapSize);
+        return new ImmutableDeletionInfo(newPartitionDeletion, clusteringComparator, rangeComparator, newRanges, rangeHeapSize + updater.rangeHeapSize, rangeBoundaryHeapSize + updater.rangeBoundaryHeapSize);
     }
 
-    private boolean canAppend(DeletionInfo update)
+    private boolean canAppend(MutableDeletionInfo update)
     {
         RangeTombstone previous = BTree.isEmpty(ranges) ? null : BTree.findByIndex(ranges, BTree.size(ranges) - 1);
         Iterator<RangeTombstone> iterator = update.rangeIterator(false);
@@ -209,7 +210,7 @@ public final class ImmutableDeletionInfo implements DeletionInfo
     @Override
     public int dataSize()
     {
-        int size = TypeSizes.sizeof(partitionDeletion.markedForDeleteAt());
+        int size = TypeSizes.sizeof(partitionDeletion.markedForDeleteAt()) + TypeSizes.sizeof(BTree.size(ranges));
         for (RangeTombstone range : BTree.<RangeTombstone>iterable(ranges))
         {
             size += range.deletedSlice().start().dataSize() + range.deletedSlice().end().dataSize();
@@ -249,7 +250,12 @@ public final class ImmutableDeletionInfo implements DeletionInfo
     @Override
     public MutableDeletionInfo mutableCopy()
     {
-        return materialize(HeapCloner.instance);
+        // Bounds and deletion times were copied when this immutable snapshot was published and are never mutated.
+        // RangeTombstoneList owns fresh, exact-capacity arrays and remains the canonical mutable merge owner;
+        // clone(ByteBufferCloner) remains the deep-copy operation for external buffers.
+        RangeTombstone[] copy = new RangeTombstone[rangeCount()];
+        BTree.toArray(ranges, copy, 0);
+        return new MutableDeletionInfo(partitionDeletion, RangeTombstoneList.fromCanonicalRanges(clusteringComparator, copy, rangeBoundaryHeapSize));
     }
 
     @Override
@@ -357,13 +363,16 @@ public final class ImmutableDeletionInfo implements DeletionInfo
         return clusteringComparator;
     }
 
-    private static ClusteringComparator sourceComparator(DeletionInfo deletionInfo)
+    private static Object[] appendCopiedRanges(Object[] existing,
+                                                MutableDeletionInfo source,
+                                                RangeComparator rangeComparator,
+                                                RangeTreeUpdater updater)
     {
-        if (deletionInfo instanceof MutableDeletionInfo)
-            return ((MutableDeletionInfo) deletionInfo).clusteringComparator();
-        if (deletionInfo instanceof ImmutableDeletionInfo)
-            return ((ImmutableDeletionInfo) deletionInfo).clusteringComparator;
-        throw new IllegalArgumentException("Unsupported deletion info type: " + deletionInfo.getClass());
+        BTree.Builder<RangeTombstone> builder = BTree.builder(rangeComparator, source.rangeCount());
+        Iterator<RangeTombstone> iterator = source.rangeIterator(false);
+        while (iterator.hasNext())
+            builder.add(clone(iterator.next(), HeapCloner.instance));
+        return BTree.update(existing, builder.build(), rangeComparator, updater);
     }
 
     private static RangeTombstone clone(RangeTombstone range, ByteBufferCloner cloner)
@@ -417,6 +426,7 @@ public final class ImmutableDeletionInfo implements DeletionInfo
     {
         private final UpdateFunction<?, ?> allocationListener;
         private long rangeHeapSize;
+        private long rangeBoundaryHeapSize;
 
         private RangeTreeUpdater(UpdateFunction<?, ?> allocationListener)
         {
@@ -428,6 +438,7 @@ public final class ImmutableDeletionInfo implements DeletionInfo
         {
             long heapSize = unsharedHeapSize(range);
             rangeHeapSize += heapSize;
+            rangeBoundaryHeapSize += range.deletedSlice().start().unsharedHeapSize() + range.deletedSlice().end().unsharedHeapSize();
             allocationListener.onAllocatedOnHeap(heapSize);
             return range;
         }

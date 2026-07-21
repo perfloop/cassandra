@@ -128,31 +128,27 @@ public class MutableDeletionInfo implements DeletionInfo
      */
     public DeletionInfo add(DeletionInfo newInfo)
     {
-        if (newInfo instanceof MutableDeletionInfo)
-        {
-            add(newInfo.getPartitionDeletion());
-            RangeTombstoneList newRanges = ((MutableDeletionInfo) newInfo).ranges;
-            if (ranges == null)
-                ranges = newRanges == null ? null : newRanges.copy();
-            else if (newRanges != null)
-                ranges.addAll(newRanges);
-            return this;
-        }
+        // This is the established mutable composition boundary. An immutable memtable snapshot must first
+        // materialize through its canonical mutable representation before its ranges are reconciled here.
+        boolean materializedImmutable = newInfo instanceof ImmutableDeletionInfo;
+        if (materializedImmutable)
+            newInfo = newInfo.mutableCopy();
 
-        if (!(newInfo instanceof ImmutableDeletionInfo))
+        if (!(newInfo instanceof MutableDeletionInfo))
             throw new IllegalArgumentException("Unsupported deletion info type: " + newInfo.getClass());
 
-        ImmutableDeletionInfo immutable = (ImmutableDeletionInfo) newInfo;
-        ClusteringComparator comparator = immutable.clusteringComparator();
-        if (ranges != null && ranges.isEmpty())
+        MutableDeletionInfo mutable = (MutableDeletionInfo) newInfo;
+        RangeTombstoneList newRanges = mutable.ranges;
+        if (materializedImmutable && ranges != null && ranges.isEmpty())
             ranges = null;
-        else if (ranges != null && !ranges.comparator().equals(comparator))
+        else if (materializedImmutable && ranges != null && newRanges != null && !ranges.comparator().equals(newRanges.comparator()))
             throw new IllegalArgumentException("Cannot combine ranges with a different clustering comparator");
 
-        add(immutable.getPartitionDeletion());
-        Iterator<RangeTombstone> iterator = immutable.rangeIterator(false);
-        while (iterator.hasNext())
-            add(iterator.next(), comparator);
+        add(mutable.getPartitionDeletion());
+        if (ranges == null)
+            ranges = newRanges == null ? null : newRanges.copy();
+        else if (newRanges != null)
+            ranges.addAll(newRanges);
         return this;
     }
 

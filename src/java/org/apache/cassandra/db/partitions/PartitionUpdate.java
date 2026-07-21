@@ -112,7 +112,8 @@ public class PartitionUpdate extends AbstractBTreePartition
     public static final PartitionUpdateSerializer serializer = new PartitionUpdateSerializer();
 
     private final BTreePartitionData holder;
-    private final DeletionInfo deletionInfo;
+    // PartitionUpdate is built with mutable deletion state and never publishes the immutable memtable representation.
+    private final MutableDeletionInfo deletionInfo;
     private final TableMetadata metadata;
     public final Epoch serializedAtEpoch;
 
@@ -398,6 +399,11 @@ public class PartitionUpdate extends AbstractBTreePartition
     // "locking" the update is nice (and used in DataResolver.RepairMergeListener.MergeListener).
     @Override
     public DeletionInfo deletionInfo()
+    {
+        return deletionInfo;
+    }
+
+    MutableDeletionInfo mutableDeletionInfo()
     {
         return deletionInfo;
     }

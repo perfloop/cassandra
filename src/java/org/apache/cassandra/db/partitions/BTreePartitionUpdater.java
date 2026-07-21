@@ -19,8 +19,8 @@
 package org.apache.cassandra.db.partitions;
 
 import org.apache.cassandra.db.DeletionInfo;
-import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.ImmutableDeletionInfo;
+import org.apache.cassandra.db.MutableDeletionInfo;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.ColumnData;
@@ -116,7 +116,7 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
             contextCloner = cloner;
         }
 
-        DeletionInfo newDeletionInfo = merge(current.deletionInfo, update.deletionInfo());
+        DeletionInfo newDeletionInfo = merge(current.deletionInfo, update.mutableDeletionInfo());
 
         RegularAndStaticColumns columns = current.columns;
         RegularAndStaticColumns newColumns = update.columns().mergeTo(columns);
@@ -140,7 +140,7 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
         return merge(current, update);
     }
 
-    private DeletionInfo merge(DeletionInfo existing, DeletionInfo update)
+    private DeletionInfo merge(DeletionInfo existing, MutableDeletionInfo update)
     {
         if (update.isLive() || !update.mayModify(existing))
             return existing;
@@ -151,8 +151,9 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
         if (update.hasRanges())
             update.rangeIterator(false).forEachRemaining(indexer::onRangeTombstone);
 
-        // Persistent immutable publication clones retained range bounds itself. The mutable fallback clones the
-        // update below because range-tombstone internal buffers may reference memory we should not retain.
+        // The published side may be immutable, but PartitionUpdate always supplies the canonical mutable owner.
+        // Persistent publication clones retained range bounds; the mutable fallback clones the update because its
+        // internal buffers may reference memory we should not retain.
         if (existing instanceof ImmutableDeletionInfo)
         {
             ImmutableDeletionInfo appended = ((ImmutableDeletionInfo) existing).tryAppend(update, this);
@@ -161,19 +162,14 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
         }
         else if (!existing.hasRanges() && update.hasRanges())
         {
-            DeletionTime partitionDeletion = update.getPartitionDeletion().supersedes(existing.getPartitionDeletion())
-                                            ? update.getPartitionDeletion()
-                                            : existing.getPartitionDeletion();
-            return ImmutableDeletionInfo.copyOf(update, partitionDeletion, this);
+            return ImmutableDeletionInfo.copyOf(update, existing.getPartitionDeletion(), this);
         }
 
-        DeletionInfo updateCopy = update.clone(HeapCloner.instance);
-        DeletionInfo newInfo = existing.mutableCopy().add(updateCopy);
-        // Materializing an immutable tree clones its range bounds, so all of the mutable representation is new.
-        // Do not subtract the BTree's full size: its payload and nodes remain shared with existing snapshots.
-        onAllocatedOnHeap(existing instanceof ImmutableDeletionInfo
-                          ? newInfo.unsharedHeapSize()
-                          : newInfo.unsharedHeapSize() - existing.unsharedHeapSize());
+        MutableDeletionInfo newInfo = existing.mutableCopy();
+        newInfo.add(update.clone(HeapCloner.instance));
+        // Model the representation transition as the same logical-size delta used by mutable deletion-info updates.
+        // The prior persistent tree is already accounted for; materialization must not charge it as new payload.
+        onAllocatedOnHeap(newInfo.unsharedHeapSize() - existing.unsharedHeapSize());
         return newInfo;
     }
 

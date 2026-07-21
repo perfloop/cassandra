@@ -136,7 +136,8 @@ public class ImmutableDeletionInfoTest
             merge(partition, overlap, writeOrder, UpdateTransaction.NO_OP);
             DeletionInfo fallback = partition.deletionInfo();
             assertTrue(fallback instanceof MutableDeletionInfo);
-            assertEquals(fallback.unsharedHeapSize(), allocator.onHeap().owns() - beforeFallback);
+            long fallbackAllocation = allocator.onHeap().owns() - beforeFallback;
+            assertEquals(fallback.unsharedHeapSize() - immutable.unsharedHeapSize(), fallbackAllocation);
             assertEquals(20_000L, fallback.rangeCovering(Clustering.make(ByteBufferUtil.bytes(overlapStart))).deletionTime().markedForDeleteAt());
         }
         finally
@@ -148,7 +149,59 @@ public class ImmutableDeletionInfoTest
     }
 
     @Test
-    public void clonesCallerRangesAndRejectsMismatchedComparators()
+    public void preservesRangesAndDataSizeAcrossImmutablePublication() throws Exception
+    {
+        TableMetadata metadata = metadata("immutable_partition_delete");
+        HeapPool pool = new HeapPool(Long.MAX_VALUE, 1.0f, () -> ImmediateFuture.success(Boolean.TRUE));
+        MemtableAllocator allocator = pool.newAllocator("immutable-partition-delete");
+        AtomicBTreePartition partition = newPartition(metadata, allocator);
+        OpOrder writeOrder = new OpOrder();
+        try
+        {
+            merge(partition, rangeUpdate(metadata, 0), writeOrder, UpdateTransaction.NO_OP);
+            DeletionInfo oneRange = partition.deletionInfo();
+            assertTrue(oneRange instanceof ImmutableDeletionInfo);
+            assertDataSizeMatches(oneRange);
+
+            PartitionUpdate twoRanges = new RowUpdateBuilder(metadata, 1, 2L, 0)
+                                        .addRangeTombstone(3, 4)
+                                        .addRangeTombstone(6, 7)
+                                        .buildUpdate();
+            merge(partition, twoRanges, writeOrder, UpdateTransaction.NO_OP);
+            DeletionInfo rangesBeforePartitionDelete = partition.deletionInfo();
+            assertTrue(rangesBeforePartitionDelete instanceof ImmutableDeletionInfo);
+            assertDataSizeMatches(rangesBeforePartitionDelete);
+            List<RangeTombstone> expectedRanges = ranges(rangesBeforePartitionDelete.rangeIterator(false));
+
+            PartitionUpdate partitionDelete = PartitionUpdate.fullPartitionDelete(metadata,
+                                                                                  metadata.partitioner.decorateKey(ByteBufferUtil.bytes(0)),
+                                                                                  10_000L,
+                                                                                  5);
+            merge(partition, partitionDelete, writeOrder, UpdateTransaction.NO_OP);
+
+            DeletionInfo withPartitionDelete = partition.deletionInfo();
+            assertTrue(withPartitionDelete instanceof ImmutableDeletionInfo);
+            assertEquals(10_000L, withPartitionDelete.getPartitionDeletion().markedForDeleteAt());
+            assertEquals(expectedRanges, ranges(withPartitionDelete.rangeIterator(false)));
+            long[] timestamps = { 1L, 2L, 2L };
+            for (int i = 0; i < timestamps.length; i++)
+            {
+                RangeTombstone range = withPartitionDelete.rangeCovering(Clustering.make(ByteBufferUtil.bytes(i * 3)));
+                assertNotNull(range);
+                assertEquals(timestamps[i], range.deletionTime().markedForDeleteAt());
+            }
+            assertDataSizeMatches(withPartitionDelete);
+        }
+        finally
+        {
+            allocator.setDiscarding();
+            allocator.setDiscarded();
+            pool.shutdownAndWait(1, TimeUnit.MINUTES);
+        }
+    }
+
+    @Test
+    public void clonesCallerRangesAndReconcilesPartitionDeletion()
     {
         ClusteringComparator comparator = new ClusteringComparator(Int32Type.instance);
         ByteBuffer start = ByteBufferUtil.bytes(1);
@@ -164,6 +217,26 @@ public class ImmutableDeletionInfoTest
         assertEquals(1L, originalRange.deletionTime().markedForDeleteAt());
         assertEquals(0L, immutable.getPartitionDeletion().markedForDeleteAt());
         assertNull(immutable.rangeCovering(Clustering.make(ByteBufferUtil.bytes(100))));
+
+        MutableDeletionInfo materialized = MutableDeletionInfo.live();
+        materialized.add(immutable);
+        assertEquals(immutable, materialized);
+        assertEquals(materialized, immutable);
+
+        MutableDeletionInfo newerSource = singleRange(comparator,
+                                                       DeletionTime.build(10L, 10L),
+                                                       ByteBufferUtil.bytes(10),
+                                                       ByteBufferUtil.bytes(11),
+                                                       DeletionTime.build(10L, 10L));
+        assertEquals(10L, ImmutableDeletionInfo.copyOf(newerSource, DeletionTime.build(9L, 9L), UpdateFunction.noOp())
+                                                   .getPartitionDeletion().markedForDeleteAt());
+        MutableDeletionInfo olderSource = singleRange(comparator,
+                                                       DeletionTime.build(9L, 9L),
+                                                       ByteBufferUtil.bytes(12),
+                                                       ByteBufferUtil.bytes(13),
+                                                       DeletionTime.build(9L, 9L));
+        assertEquals(10L, ImmutableDeletionInfo.copyOf(olderSource, DeletionTime.build(10L, 10L), UpdateFunction.noOp())
+                                                   .getPartitionDeletion().markedForDeleteAt());
 
         ByteBuffer appendedStart = ByteBufferUtil.bytes(4);
         DeletionTime.ReusableDeletionTime appendedRangeDeletion = DeletionTime.ReusableDeletionTime.copy(DeletionTime.build(2L, 2L));
@@ -315,6 +388,11 @@ public class ImmutableDeletionInfoTest
     {
         assertEquals(ranges(expected.rangeIterator(slice, false)), ranges(actual.rangeIterator(slice, false)));
         assertEquals(ranges(expected.rangeIterator(slice, true)), ranges(actual.rangeIterator(slice, true)));
+    }
+
+    private static void assertDataSizeMatches(DeletionInfo deletionInfo)
+    {
+        assertEquals(deletionInfo.mutableCopy().dataSize(), deletionInfo.dataSize());
     }
 
     private static void assertAllTimestamps(DeletionInfo deletionInfo, long timestamp, int localDeletionTime)
