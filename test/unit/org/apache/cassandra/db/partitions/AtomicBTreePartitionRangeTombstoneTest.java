@@ -17,6 +17,7 @@
 
 package org.apache.cassandra.db.partitions;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -219,13 +220,13 @@ public class AtomicBTreePartitionRangeTombstoneTest
     private static void assertRange(RangeTombstone range, int start, int end, long timestamp)
     {
         assertEquals(start, start(range));
-        assertEquals(end, Int32Type.instance.compose(range.deletedSlice().end().get(0)).intValue());
+        assertEquals(end, Int32Type.instance.compose((ByteBuffer) range.deletedSlice().end().get(0)).intValue());
         assertEquals(timestamp, range.deletionTime().markedForDeleteAt());
     }
 
     private static int start(RangeTombstone range)
     {
-        return Int32Type.instance.compose(range.deletedSlice().start().get(0));
+        return Int32Type.instance.compose((ByteBuffer) range.deletedSlice().start().get(0));
     }
 
     private static Clustering<?> clustering(int value)
