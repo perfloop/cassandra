@@ -42,6 +42,7 @@ import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.HeapCloner;
@@ -88,7 +89,7 @@ public class AtomicBTreePartitionRangeTombstoneTest
 
             DeletionInfo published = state.partition.deletionInfo();
             assertEquals(RANGE_COUNT, published.rangeCount());
-            assertEquals(state.allocator.onHeap().owns(), published.unsharedHeapSize());
+            assertRangeOnlyAccounting(state);
 
             for (int i : new int[] { 0, 1, 123, RANGE_COUNT - 1 })
             {
@@ -116,7 +117,7 @@ public class AtomicBTreePartitionRangeTombstoneTest
             DeletionInfo withPartitionDelete = state.partition.deletionInfo();
             assertEquals(RANGE_COUNT + 1L, withPartitionDelete.getPartitionDeletion().markedForDeleteAt());
             assertEquals(RANGE_COUNT, withPartitionDelete.rangeCount());
-            assertEquals(state.allocator.onHeap().owns(), withPartitionDelete.unsharedHeapSize());
+            assertRangeOnlyAccounting(state);
         }
         finally
         {
@@ -204,6 +205,16 @@ public class AtomicBTreePartitionRangeTombstoneTest
         {
             state.close();
         }
+    }
+
+    private static void assertRangeOnlyAccounting(State state)
+    {
+        BTreePartitionData holder = state.partition.unsafeGetHolder();
+        long expected = holder.deletionInfo.unsharedHeapSize()
+                        + holder.columns.unsharedHeapSize()
+                        + BTree.sizeOnHeapOf(holder.tree)
+                        + holder.stats.unsharedHeapSize();
+        assertEquals(expected, state.allocator.onHeap().owns());
     }
 
     private static void assertSliceStarts(Iterator<RangeTombstone> ranges, int first, int last, boolean reversed)
