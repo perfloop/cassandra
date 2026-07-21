@@ -26,17 +26,23 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.jboss.byteman.contrib.bmunit.BMRule;
+import org.jboss.byteman.contrib.bmunit.BMUnitRunner;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.junit.runner.RunWith;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ClusteringBound;
 import org.apache.cassandra.db.DeletionInfo;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.MutableDeletionInfo;
 import org.apache.cassandra.db.RangeTombstone;
+import org.apache.cassandra.db.RangeTombstoneList;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.Slice;
 import org.apache.cassandra.db.marshal.Int32Type;
@@ -56,6 +62,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+@RunWith(BMUnitRunner.class)
 public class AtomicBTreePartitionRangeTombstoneTest
 {
     private static final int RANGE_COUNT = 4096;
@@ -66,6 +73,7 @@ public class AtomicBTreePartitionRangeTombstoneTest
     private static TableMetadata metadata;
     private static org.apache.cassandra.db.DecoratedKey key;
     private static PartitionUpdate[] appendUpdates;
+    private static final AtomicInteger rangeListCopyCalls = new AtomicInteger();
 
     @BeforeClass
     public static void beforeClass()
@@ -102,6 +110,16 @@ public class AtomicBTreePartitionRangeTombstoneTest
         assertRangeOrder(collect(info.rangeIterator(slice, false)), 8, 9, 10, 11, 12);
         assertRangeOrder(collect(info.rangeIterator(slice, true)), 12, 11, 10, 9, 8);
 
+        Slice inclusiveSlice = Slice.make(ClusteringBound.inclusiveStartOf(clustering(8 * RANGE_WIDTH - 1)),
+                                          ClusteringBound.inclusiveEndOf(clustering(12 * RANGE_WIDTH + 2)));
+        assertRangeOrder(collect(info.rangeIterator(inclusiveSlice, false)), 8, 9, 10, 11, 12);
+        assertRangeOrder(collect(info.rangeIterator(inclusiveSlice, true)), 12, 11, 10, 9, 8);
+
+        Slice exclusiveSlice = Slice.make(ClusteringBound.exclusiveStartOf(clustering(8 * RANGE_WIDTH - 1)),
+                                          ClusteringBound.exclusiveEndOf(clustering(12 * RANGE_WIDTH + 2)));
+        assertRangeOrder(collect(info.rangeIterator(exclusiveSlice, false)), 8, 9, 10, 11, 12);
+        assertRangeOrder(collect(info.rangeIterator(exclusiveSlice, true)), 12, 11, 10, 9, 8);
+
         MutableDeletionInfo canonical = canonical(RANGE_COUNT);
         assertEquals(canonical, info);
         assertEquals(info, canonical);
@@ -133,6 +151,40 @@ public class AtomicBTreePartitionRangeTombstoneTest
                         + holder.columns.unsharedHeapSize() - BTreePartitionData.EMPTY.columns.unsharedHeapSize()
                         + holder.stats.unsharedHeapSize() - EncodingStats.NO_STATS.unsharedHeapSize();
         assertEquals(expected, allocator.onHeap().owns());
+    }
+
+    @Test
+    @BMRule(name = "Count generic range tombstone copies",
+            targetClass = "org.apache.cassandra.db.RangeTombstoneList",
+            targetMethod = "copy",
+            targetLocation = "AT ENTRY",
+            action = "org.apache.cassandra.db.partitions.AtomicBTreePartitionRangeTombstoneTest.recordRangeListCopy()")
+    public void testGenericMutableCopyRemainsDeepAndCompact()
+    {
+        RangeTombstoneList oversized = new RangeTombstoneList(metadata.comparator, RANGE_COUNT * 2);
+        for (int i = 0; i < RANGE_COUNT; i++)
+            oversized.add(range(i, i + 1L));
+
+        MutableDeletionInfo original = new MutableDeletionInfo(DeletionTime.LIVE, oversized);
+        MutableDeletionInfo compact = original.mutableCopy();
+        assertEquals(original, compact);
+        assertTrue(compact.unsharedHeapSize() < original.unsharedHeapSize());
+
+        compact.updateAllTimestamp(RANGE_COUNT + 100L);
+        assertRange(original, 0, 1L);
+        assertRange(compact, 0, RANGE_COUNT + 100L);
+
+        rangeListCopyCalls.set(0);
+        MutableDeletionInfo repeated = original;
+        for (int i = 1; i < RANGE_COUNT; i++)
+            repeated = repeated.mutableCopy();
+        assertEquals(RANGE_COUNT - 1, rangeListCopyCalls.get());
+        assertEquals(original, repeated);
+    }
+
+    public static void recordRangeListCopy()
+    {
+        rangeListCopyCalls.incrementAndGet();
     }
 
     @Test

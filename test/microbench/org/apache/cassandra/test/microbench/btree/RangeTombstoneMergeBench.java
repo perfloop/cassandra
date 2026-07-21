@@ -68,7 +68,6 @@ public class RangeTombstoneMergeBench
     private DecoratedKey key;
     private PartitionUpdate[] appendUpdates;
     private PartitionUpdate supersedingPartitionDelete;
-    private PartitionUpdate overlappingRange;
 
     @Setup(Level.Trial)
     public void setup()
@@ -87,29 +86,19 @@ public class RangeTombstoneMergeBench
             appendUpdates[i] = rangeUpdate(i, i + 1L);
 
         supersedingPartitionDelete = PartitionUpdate.fullPartitionDelete(metadata, key, UPDATE_COUNT + 1L, UPDATE_COUNT + 1L);
-        overlappingRange = rangeUpdate(UPDATE_COUNT / 2, UPDATE_COUNT + 2L);
     }
 
     @Benchmark
-    public long merge4096SingleRangeUpdates()
+    public long merge4096SingleRangeUpdates(AppendState state)
     {
-        MemtableAllocator allocator = new HeapPool.Allocator(POOL);
-        AtomicBTreePartition partition = newPartition(allocator);
-        applyPrefix(partition, allocator.cloner(NO_ORDER.getCurrent()));
-        return result(partition.deletionInfo());
-    }
-
-    @Benchmark
-    public long mergeSupersedingPartitionDelete(PrefixState state)
-    {
-        state.partition.addAll(supersedingPartitionDelete, state.cloner, NO_ORDER.getCurrent(), UpdateTransaction.NO_OP);
+        state.partition.addAll(appendUpdates[UPDATE_COUNT - 1], state.cloner, NO_ORDER.getCurrent(), UpdateTransaction.NO_OP);
         return result(state.partition.deletionInfo());
     }
 
     @Benchmark
-    public long mergeOverlappingRangeAfter4096Prefix(PrefixState state)
+    public long mergeSupersedingPartitionDelete(FullPrefixState state)
     {
-        state.partition.addAll(overlappingRange, state.cloner, NO_ORDER.getCurrent(), UpdateTransaction.NO_OP);
+        state.partition.addAll(supersedingPartitionDelete, state.cloner, NO_ORDER.getCurrent(), UpdateTransaction.NO_OP);
         return result(state.partition.deletionInfo());
     }
 
@@ -118,10 +107,10 @@ public class RangeTombstoneMergeBench
         return new AtomicBTreePartition(TableMetadataRef.forOfflineTools(metadata), key, allocator);
     }
 
-    private void applyPrefix(AtomicBTreePartition partition, Cloner cloner)
+    private void applyPrefix(AtomicBTreePartition partition, Cloner cloner, int count)
     {
-        for (PartitionUpdate update : appendUpdates)
-            partition.addAll(update, cloner, NO_ORDER.getCurrent(), UpdateTransaction.NO_OP);
+        for (int i = 0; i < count; i++)
+            partition.addAll(appendUpdates[i], cloner, NO_ORDER.getCurrent(), UpdateTransaction.NO_OP);
     }
 
     private PartitionUpdate rangeUpdate(int index, long timestamp)
@@ -143,7 +132,7 @@ public class RangeTombstoneMergeBench
     }
 
     @State(Scope.Thread)
-    public static class PrefixState
+    public static class AppendState
     {
         private BTreePartitionData prefix;
         private AtomicBTreePartition partition;
@@ -154,7 +143,33 @@ public class RangeTombstoneMergeBench
         {
             MemtableAllocator allocator = new HeapPool.Allocator(POOL);
             AtomicBTreePartition source = bench.newPartition(allocator);
-            bench.applyPrefix(source, allocator.cloner(NO_ORDER.getCurrent()));
+            bench.applyPrefix(source, allocator.cloner(NO_ORDER.getCurrent()), UPDATE_COUNT - 1);
+            prefix = source.unsafeGetHolder();
+        }
+
+        @Setup(Level.Invocation)
+        public void setupInvocation(RangeTombstoneMergeBench bench)
+        {
+            MemtableAllocator allocator = new HeapPool.Allocator(POOL);
+            partition = bench.newPartition(allocator);
+            partition.unsafeSetHolder(prefix);
+            cloner = allocator.cloner(NO_ORDER.getCurrent());
+        }
+    }
+
+    @State(Scope.Thread)
+    public static class FullPrefixState
+    {
+        private BTreePartitionData prefix;
+        private AtomicBTreePartition partition;
+        private Cloner cloner;
+
+        @Setup(Level.Trial)
+        public void setupPrefix(RangeTombstoneMergeBench bench)
+        {
+            MemtableAllocator allocator = new HeapPool.Allocator(POOL);
+            AtomicBTreePartition source = bench.newPartition(allocator);
+            bench.applyPrefix(source, allocator.cloner(NO_ORDER.getCurrent()), UPDATE_COUNT);
             prefix = source.unsafeGetHolder();
         }
 
