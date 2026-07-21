@@ -65,6 +65,7 @@ public class RangeTombstoneMergeBench
 
     static
     {
+        DatabaseDescriptor.daemonInitialization();
         DatabaseDescriptor.setPartitionerUnsafe(ByteOrderedPartitioner.instance);
         METADATA = TableMetadata.builder("perfloop", "range_tombstone_merge")
                                 .addPartitionKeyColumn("pk", Int32Type.instance)
