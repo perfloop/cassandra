@@ -53,7 +53,6 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
 
 public class AtomicBTreePartitionRangeTombstoneTest
 {
@@ -86,11 +85,11 @@ public class AtomicBTreePartitionRangeTombstoneTest
         try
         {
             for (int i = 0; i < RANGE_COUNT; i++)
-                state.apply(rangeUpdate(i, i + 1L), UpdateTransaction.NO_OP);
+                applyAndAssertUpdaterLedger(state, rangeUpdate(i, i + 1L));
 
             DeletionInfo published = state.partition.deletionInfo();
             assertEquals(RANGE_COUNT, published.rangeCount());
-            assertRangeOnlyAccounting(state);
+            assertAllocatorMatchesUpdaterLedger(state);
 
             for (int i : new int[] { 0, 1, 123, RANGE_COUNT - 1 })
             {
@@ -114,11 +113,11 @@ public class AtomicBTreePartitionRangeTombstoneTest
             assertEquals(1L, published.rangeIterator(false).next().deletionTime().markedForDeleteAt());
             assertEquals(10_000L, mutableCopy.rangeIterator(false).next().deletionTime().markedForDeleteAt());
 
-            state.apply(partitionDelete(RANGE_COUNT + 1L), UpdateTransaction.NO_OP);
+            applyAndAssertUpdaterLedger(state, partitionDelete(RANGE_COUNT + 1L));
             DeletionInfo withPartitionDelete = state.partition.deletionInfo();
             assertEquals(RANGE_COUNT + 1L, withPartitionDelete.getPartitionDeletion().markedForDeleteAt());
             assertEquals(RANGE_COUNT, withPartitionDelete.rangeCount());
-            assertRangeOnlyAccounting(state);
+            assertAllocatorMatchesUpdaterLedger(state);
         }
         finally
         {
@@ -208,24 +207,34 @@ public class AtomicBTreePartitionRangeTombstoneTest
         }
     }
 
-    private static void assertRangeOnlyAccounting(State state)
+    private static void applyAndAssertUpdaterLedger(State state, PartitionUpdate update)
     {
-        BTreePartitionData empty = BTreePartitionData.unsafeGetEmpty();
-        BTreePartitionData holder = state.partition.unsafeGetHolder();
+        BTreePartitionData previous = state.partition.unsafeGetHolder();
+        BTreePartitionUpdater updater = state.apply(update, UpdateTransaction.NO_OP);
+        BTreePartitionData current = state.partition.unsafeGetHolder();
 
-        // AtomicBTreePartition.Updater starts from the shared empty holder and calls
-        // makeMergedPartition directly. The memtable accounts the holder separately,
-        // so this allocator contains only the updater's component deltas.
-        assertTrue(BTree.isEmpty(holder.tree));
-        assertTrue(holder.staticRow.isEmpty());
+        long expected = updaterLedger(previous, current);
+        assertEquals(expected, updater.heapSize);
+        state.updaterLedger += expected;
+        assertAllocatorMatchesUpdaterLedger(state);
+    }
 
-        long expected = holder.deletionInfo.unsharedHeapSize() - empty.deletionInfo.unsharedHeapSize()
-                        + holder.columns.unsharedHeapSize() - empty.columns.unsharedHeapSize()
-                        + BTree.sizeOnHeapOf(holder.tree) - BTree.sizeOnHeapOf(empty.tree)
-                        + holder.staticRow.unsharedHeapSizeExcludingData()
-                        - empty.staticRow.unsharedHeapSizeExcludingData()
-                        + holder.stats.unsharedHeapSize() - empty.stats.unsharedHeapSize();
-        assertEquals(expected, state.allocator.onHeap().owns());
+    private static long updaterLedger(BTreePartitionData previous, BTreePartitionData current)
+    {
+        // AtomicBTreePartition.Updater.tryUpdateData invokes makeMergedPartition with its
+        // non-null ref, so it does not take mergePartitions' BTreePartitionData holder-charge
+        // branch. The remaining terms mirror every allocation delta charged by that method.
+        return current.deletionInfo.unsharedHeapSize() - previous.deletionInfo.unsharedHeapSize()
+               + current.columns.unsharedHeapSize() - previous.columns.unsharedHeapSize()
+               + BTree.sizeOnHeapOf(current.tree) - BTree.sizeOnHeapOf(previous.tree)
+               + current.staticRow.unsharedHeapSizeExcludingData()
+               - previous.staticRow.unsharedHeapSizeExcludingData()
+               + current.stats.unsharedHeapSize() - previous.stats.unsharedHeapSize();
+    }
+
+    private static void assertAllocatorMatchesUpdaterLedger(State state)
+    {
+        assertEquals(state.updaterLedger, state.allocator.onHeap().owns());
     }
 
     private static void assertSliceStarts(Iterator<RangeTombstone> ranges, int first, int last, boolean reversed)
@@ -286,11 +295,12 @@ public class AtomicBTreePartitionRangeTombstoneTest
     {
         private final MemtableAllocator allocator = new HeapPool.Allocator(POOL);
         private final AtomicBTreePartition partition = new AtomicBTreePartition(metadataRef, partitionKey, allocator);
+        private long updaterLedger;
 
-        private void apply(PartitionUpdate update, UpdateTransaction indexer)
+        private BTreePartitionUpdater apply(PartitionUpdate update, UpdateTransaction indexer)
         {
             OpOrder.Group writeOp = NO_ORDER.getCurrent();
-            partition.addAll(update, allocator.cloner(writeOp), writeOp, indexer);
+            return partition.addAll(update, allocator.cloner(writeOp), writeOp, indexer);
         }
 
         private void close()

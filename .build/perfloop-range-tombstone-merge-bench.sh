@@ -21,7 +21,7 @@ git submodule update --init --recursive --depth 1 --jobs 8
 test -x modules/accord/gradlew
 
 # test/bin/jmh uses the compiled test classes and the Cassandra jar.
-ant build-test
+ant -Dmaven.repo.local=/workspace/deps/m2 -Dlocal.repository=/workspace/deps/m2 build-test
 
 : "${PERFLOOP_BENCH_BIN:?PERFLOOP_BENCH_BIN must name the replay launcher}"
 cat >"${PERFLOOP_BENCH_BIN}" <<'LAUNCHER'
