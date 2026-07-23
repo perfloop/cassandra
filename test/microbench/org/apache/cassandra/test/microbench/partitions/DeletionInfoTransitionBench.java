@@ -159,6 +159,26 @@ public class DeletionInfoTransitionBench
     }
 
     @State(Scope.Thread)
+    public static class SliceSuiteState
+    {
+        @Param({"128", "4096"})
+        public int prefixRanges;
+
+        private DeletionInfo deletionInfo;
+        private Slice[] slices;
+
+        @Setup(Level.Trial)
+        public void setup()
+        {
+            deletionInfo = partitionWithPrefix(prefixRanges).deletionInfo();
+            slices = new Slice[]{ slice(prefixRanges, "EARLY"),
+                                  slice(prefixRanges, "MIDDLE"),
+                                  slice(prefixRanges, "LATE"),
+                                  slice(prefixRanges, "MISS") };
+        }
+    }
+
+    @State(Scope.Thread)
     public static class LookupState
     {
         @Param({"128", "4096"})
@@ -174,14 +194,25 @@ public class DeletionInfoTransitionBench
         public void setup()
         {
             deletionInfo = partitionWithPrefix(prefixRanges).deletionInfo();
-            clusterings = new Clustering<?>[LOOKUPS_PER_INVOCATION];
-            int start = prefixRanges / 4;
-            for (int i = 0; i < clusterings.length; i++)
-            {
-                int range = (start + i) % prefixRanges;
-                int value = range * RANGE_STRIDE + ("COVERED".equals(lookup) ? 2 : 6);
-                clusterings[i] = Clustering.make(ByteBufferUtil.bytes(value));
-            }
+            clusterings = clusterings(prefixRanges, "COVERED".equals(lookup));
+        }
+    }
+
+    @State(Scope.Thread)
+    public static class LookupSuiteState
+    {
+        @Param({"128", "4096"})
+        public int prefixRanges;
+
+        private DeletionInfo deletionInfo;
+        private Clustering<?>[][] clusterings;
+
+        @Setup(Level.Trial)
+        public void setup()
+        {
+            deletionInfo = partitionWithPrefix(prefixRanges).deletionInfo();
+            clusterings = new Clustering<?>[][]{ clusterings(prefixRanges, true),
+                                                 clusterings(prefixRanges, false) };
         }
     }
 
@@ -211,16 +242,41 @@ public class DeletionInfoTransitionBench
     }
 
     @Benchmark
+    @OperationsPerInvocation(8)
+    public void rangeSliceSuite(SliceSuiteState state, Blackhole blackhole)
+    {
+        long timestampSum = 0;
+        int count = 0;
+        for (Slice slice : state.slices)
+        {
+            for (int direction = 0; direction < 2; direction++)
+            {
+                Iterator<RangeTombstone> iterator = state.deletionInfo.rangeIterator(slice, direction == 1);
+                while (iterator.hasNext())
+                {
+                    timestampSum += iterator.next().deletionTime().markedForDeleteAt();
+                    count++;
+                }
+            }
+        }
+        blackhole.consume(timestampSum);
+        blackhole.consume(count);
+    }
+
+    @Benchmark
     @OperationsPerInvocation(LOOKUPS_PER_INVOCATION)
     public void rangeCovering(LookupState state, Blackhole blackhole)
     {
+        blackhole.consume(rangeCovering(state.deletionInfo, state.clusterings));
+    }
+
+    @Benchmark
+    @OperationsPerInvocation(2 * LOOKUPS_PER_INVOCATION)
+    public void rangeCoveringSuite(LookupSuiteState state, Blackhole blackhole)
+    {
         long timestampSum = 0;
-        for (Clustering<?> clustering : state.clusterings)
-        {
-            RangeTombstone tombstone = state.deletionInfo.rangeCovering(clustering);
-            if (tombstone != null)
-                timestampSum += tombstone.deletionTime().markedForDeleteAt();
-        }
+        for (Clustering<?>[] clusterings : state.clusterings)
+            timestampSum += rangeCovering(state.deletionInfo, clusterings);
         blackhole.consume(timestampSum);
     }
 
@@ -234,6 +290,31 @@ public class DeletionInfoTransitionBench
             partition.addAll(update(prefix(rangeCount)), allocator.cloner(writeOp), writeOp, UpdateTransaction.NO_OP);
         }
         return partition;
+    }
+
+    private static long rangeCovering(DeletionInfo deletionInfo, Clustering<?>[] clusterings)
+    {
+        long timestampSum = 0;
+        for (Clustering<?> clustering : clusterings)
+        {
+            RangeTombstone tombstone = deletionInfo.rangeCovering(clustering);
+            if (tombstone != null)
+                timestampSum += tombstone.deletionTime().markedForDeleteAt();
+        }
+        return timestampSum;
+    }
+
+    private static Clustering<?>[] clusterings(int prefixRanges, boolean covered)
+    {
+        Clustering<?>[] clusterings = new Clustering<?>[LOOKUPS_PER_INVOCATION];
+        int start = prefixRanges / 4;
+        for (int i = 0; i < clusterings.length; i++)
+        {
+            int range = (start + i) % prefixRanges;
+            int value = range * RANGE_STRIDE + (covered ? 2 : 6);
+            clusterings[i] = Clustering.make(ByteBufferUtil.bytes(value));
+        }
+        return clusterings;
     }
 
     private static MutableDeletionInfo prefix(int rangeCount)
