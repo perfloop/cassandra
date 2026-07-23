@@ -169,6 +169,29 @@ public class RangeTombstoneListTest
     }
 
     @Test
+    public void btreeDeletionInfoPointLookupPatchesSurviveCompaction()
+    {
+        MutableDeletionInfo expected = MutableDeletionInfo.live();
+        for (int i = 0; i < 4096; i++)
+            expected.add(rt(i * 8, i * 8 + 3, 100), cmp);
+
+        BTreeDeletionInfo actual = BTreeDeletionInfo.merge(expected, MutableDeletionInfo.live(), cmp);
+        Iterator<RangeTombstone> ranges = expected.rangeIterator(false);
+        RangeTombstone first = ranges.next();
+        for (int i = 0; i < 33; i++)
+        {
+            RangeTombstone range = i < 2 ? first : ranges.next();
+            MutableDeletionInfo update = MutableDeletionInfo.live();
+            update.add(new RangeTombstone(range.deletedSlice(), DeletionTime.build(200 + i, 20 + i)), cmp);
+            expected.add(update);
+            actual = BTreeDeletionInfo.merge(actual, update, cmp);
+            assertBTreePointLookups(expected, actual, 33);
+        }
+        assertBTreeRanges(expected, actual);
+        assertEquals(expected.dataSize(), actual.dataSize());
+    }
+
+    @Test
     public void simpleOverlapTest()
     {
         RangeTombstoneList l1 = new RangeTombstoneList(cmp, 0);
@@ -640,6 +663,24 @@ public class RangeTombstoneListTest
         {
             verifier.accept(throwable);
         }
+    }
+
+    private static void assertBTreePointLookups(DeletionInfo expected, DeletionInfo actual, int count)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            assertRT(expected.rangeCovering(clustering(i * 8 + 1)), actual.rangeCovering(clustering(i * 8 + 1)));
+            assertEquals(expected.rangeCovering(clustering(i * 8 + 5)), actual.rangeCovering(clustering(i * 8 + 5)));
+        }
+    }
+
+    private static void assertBTreeRanges(DeletionInfo expected, DeletionInfo actual)
+    {
+        Iterator<RangeTombstone> expectedRanges = expected.rangeIterator(false);
+        Iterator<RangeTombstone> actualRanges = actual.rangeIterator(false);
+        while (expectedRanges.hasNext() && actualRanges.hasNext())
+            assertRT(expectedRanges.next(), actualRanges.next());
+        assertEquals(expectedRanges.hasNext(), actualRanges.hasNext());
     }
 
     private static void assertRT(RangeTombstone expected, RangeTombstone actual)

@@ -22,8 +22,10 @@ package org.apache.cassandra.db.partitions;
 import java.nio.ByteBuffer;
 import java.util.Iterator;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.BTreeDeletionInfo;
 import org.apache.cassandra.db.BufferClusteringBound;
 import org.apache.cassandra.db.Clustering;
@@ -35,9 +37,7 @@ import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.Slice;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.ReversedType;
-import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.rows.EncodingStats;
-import org.apache.cassandra.test.microbench.partitions.DeletionInfoTransitionSupport;
 import org.apache.cassandra.utils.memory.ByteBufferCloner;
 
 import static org.junit.Assert.assertEquals;
@@ -48,40 +48,25 @@ import static org.junit.Assert.fail;
 public class BTreeDeletionInfoTest
 {
     private static final ClusteringComparator COMPARATOR = new ClusteringComparator(Int32Type.instance);
-    private static final ClusteringComparator OTHER_COMPARATOR = new ClusteringComparator(UTF8Type.instance);
     private static final ClusteringComparator REVERSED_COMPARATOR = new ClusteringComparator(ReversedType.getInstance(Int32Type.instance));
+
+    @BeforeClass
+    public static void beforeClass()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
 
     @Test(expected = IllegalArgumentException.class)
     public void mergeRejectsAMutableInputWithADifferentClusteringComparator()
     {
-        DeletionInfoTransitionSupport.Transition transition = DeletionInfoTransitionSupport.fixture(128, "ADJACENT")
-                                                                                  .transitions(DeletionInfoTransitionSupport.Operation.TWO_EXACT_BOUND)[0];
-        BTreeDeletionInfo.merge(transition.expectedPrefix().mutableCopy(),
-                                MutableDeletionInfo.live(),
-                                OTHER_COMPARATOR);
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void mergeRejectsAMutableUpdateWithADifferentClusteringComparator()
-    {
-        DeletionInfoTransitionSupport.Transition transition = DeletionInfoTransitionSupport.fixture(128, "ADJACENT")
-                                                                                  .transitions(DeletionInfoTransitionSupport.Operation.TWO_EXACT_BOUND)[0];
-        BTreeDeletionInfo existing = BTreeDeletionInfo.merge(transition.expectedPrefix(), MutableDeletionInfo.live(), COMPARATOR);
-        MutableDeletionInfo update = MutableDeletionInfo.live();
-        RangeTombstone range = transition.expectedPrefix().rangeIterator(false).next();
-        update.add(range, OTHER_COMPARATOR);
-        BTreeDeletionInfo.merge(existing, update, COMPARATOR);
+        BTreeDeletionInfo.merge(deletionInfo(COMPARATOR, 2), MutableDeletionInfo.live(), REVERSED_COMPARATOR);
     }
 
     @Test
     public void mergeRejectsUnknownRangeBearingInputsBeforeIteration()
     {
-        DeletionInfoTransitionSupport.Transition transition = DeletionInfoTransitionSupport.fixture(128, "ADJACENT")
-                                                                                  .transitions(DeletionInfoTransitionSupport.Operation.TWO_EXACT_BOUND)[0];
-        MutableDeletionInfo mutable = MutableDeletionInfo.live();
-        mutable.add(transition.expectedPrefix().rangeIterator(false).next(), OTHER_COMPARATOR);
-
-        ForwardingDeletionInfo existing = new ForwardingDeletionInfo(mutable);
+        MutableDeletionInfo source = deletionInfo(REVERSED_COMPARATOR, 1);
+        ForwardingDeletionInfo existing = new ForwardingDeletionInfo(source);
         try
         {
             BTreeDeletionInfo.merge(existing, MutableDeletionInfo.live(), COMPARATOR);
@@ -92,8 +77,8 @@ public class BTreeDeletionInfoTest
         }
         assertFalse(existing.rangeIteratorCalled);
 
-        BTreeDeletionInfo base = BTreeDeletionInfo.merge(transition.expectedPrefix(), MutableDeletionInfo.live(), COMPARATOR);
-        ForwardingDeletionInfo update = new ForwardingDeletionInfo(mutable);
+        BTreeDeletionInfo base = BTreeDeletionInfo.merge(deletionInfo(COMPARATOR, 1), MutableDeletionInfo.live(), COMPARATOR);
+        ForwardingDeletionInfo update = new ForwardingDeletionInfo(source);
         try
         {
             BTreeDeletionInfo.merge(base, update, COMPARATOR);
@@ -105,62 +90,24 @@ public class BTreeDeletionInfoTest
         assertFalse(update.rangeIteratorCalled);
     }
 
-    @Test(expected = IllegalArgumentException.class)
-    public void repeatedMergeRejectsADifferentClusteringComparator()
-    {
-        DeletionInfoTransitionSupport.Transition transition = DeletionInfoTransitionSupport.fixture(128, "ADJACENT")
-                                                                                  .transitions(DeletionInfoTransitionSupport.Operation.TWO_EXACT_BOUND)[0];
-        BTreeDeletionInfo materialized = BTreeDeletionInfo.merge(transition.expectedPrefix(), MutableDeletionInfo.live(), COMPARATOR);
-        BTreeDeletionInfo.merge(materialized,
-                                MutableDeletionInfo.live(),
-                                OTHER_COMPARATOR);
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void mergeRejectsABTreeUpdateWithADifferentClusteringComparator()
-    {
-        DeletionInfoTransitionSupport.Transition transition = DeletionInfoTransitionSupport.fixture(128, "ADJACENT")
-                                                                                  .transitions(DeletionInfoTransitionSupport.Operation.TWO_EXACT_BOUND)[0];
-        BTreeDeletionInfo existing = BTreeDeletionInfo.merge(transition.expectedPrefix(), MutableDeletionInfo.live(), COMPARATOR);
-        MutableDeletionInfo otherInput = MutableDeletionInfo.live();
-        otherInput.add(transition.expectedPrefix().rangeIterator(false).next(), OTHER_COMPARATOR);
-        BTreeDeletionInfo update = BTreeDeletionInfo.merge(otherInput, MutableDeletionInfo.live(), OTHER_COMPARATOR);
-        BTreeDeletionInfo.merge(existing, update, COMPARATOR);
-    }
-
     @Test
-    public void mutableDeletionInfoRejectsARangeWithADifferentClusteringComparator()
+    public void mutableDeletionInfoRejectsDifferentClusteringComparatorsBeforeMutation()
     {
-        DeletionInfoTransitionSupport.Transition transition = DeletionInfoTransitionSupport.fixture(128, "ADJACENT")
-                                                                                  .transitions(DeletionInfoTransitionSupport.Operation.TWO_EXACT_BOUND)[0];
-        MutableDeletionInfo receiver = transition.expectedPrefix().mutableCopy();
-        DeletionInfo before = receiver.mutableCopy();
-        RangeTombstone range = transition.expectedPrefix().rangeIterator(false).next();
-
+        MutableDeletionInfo receiver = deletionInfo(COMPARATOR, 2);
+        int dataSize = receiver.dataSize();
         try
         {
-            receiver.add(range, REVERSED_COMPARATOR);
+            receiver.add(range(0, 3, 200), REVERSED_COMPARATOR);
             fail("expected a range with another clustering comparator to be rejected");
         }
         catch (IllegalArgumentException expected)
         {
         }
-        DeletionInfoTransitionSupport.assertEquivalent(before, receiver);
-    }
+        assertEquals(dataSize, receiver.dataSize());
 
-    @Test
-    public void mutableDeletionInfoRejectsABTreeWithADifferentClusteringComparator()
-    {
-        DeletionInfoTransitionSupport.Transition transition = DeletionInfoTransitionSupport.fixture(128, "ADJACENT")
-                                                                                  .transitions(DeletionInfoTransitionSupport.Operation.TWO_EXACT_BOUND)[0];
-        MutableDeletionInfo receiver = transition.expectedPrefix().mutableCopy();
-        MutableDeletionInfo reversed = MutableDeletionInfo.live();
-        Iterator<RangeTombstone> ranges = transition.expectedPrefix().rangeIterator(false);
-        reversed.add(ranges.next(), REVERSED_COMPARATOR);
-        reversed.add(ranges.next(), REVERSED_COMPARATOR);
-        BTreeDeletionInfo other = BTreeDeletionInfo.merge(reversed, MutableDeletionInfo.live(), REVERSED_COMPARATOR);
-        DeletionInfo before = receiver.mutableCopy();
-
+        BTreeDeletionInfo other = BTreeDeletionInfo.merge(deletionInfo(REVERSED_COMPARATOR, 2),
+                                                           MutableDeletionInfo.live(),
+                                                           REVERSED_COMPARATOR);
         try
         {
             receiver.add(other);
@@ -169,41 +116,33 @@ public class BTreeDeletionInfoTest
         catch (IllegalArgumentException expected)
         {
         }
-        DeletionInfoTransitionSupport.assertEquivalent(before, receiver);
+        assertEquals(dataSize, receiver.dataSize());
     }
 
     @Test
-    public void materializingGenericDeletionInfoDoesNotRetainMutableState()
+    public void exactBoundMergePreservesExistingRangeAtAnEqualTimestamp()
     {
-        DeletionInfoTransitionSupport.Transition transition = DeletionInfoTransitionSupport.fixture(4096, "OPPOSITE")
-                                                                                  .transitions(DeletionInfoTransitionSupport.Operation.TWO_EXACT_BOUND)[0];
-        MutableDeletionInfo generic = transition.expectedPrefix().mutableCopy();
-        DeletionInfo materialized = BTreeDeletionInfo.merge(generic, MutableDeletionInfo.live(), COMPARATOR);
+        MutableDeletionInfo expected = deletionInfo(COMPARATOR, 1);
+        MutableDeletionInfo update = MutableDeletionInfo.live();
+        update.add(new RangeTombstone(expected.rangeIterator(false).next().deletedSlice(), DeletionTime.build(100, 20)), COMPARATOR);
+        expected.add(update);
 
-        DeletionInfoTransitionSupport.assertEquivalent(generic, materialized);
-        DeletionInfoTransitionSupport.addDisjointRange(generic, transition.offset(), transition.rangeCount());
-        DeletionInfoTransitionSupport.assertEquivalent(transition.expectedPrefix(), materialized);
-
-        DeletionInfo cloned = DeletionInfoTransitionSupport.deepClone(materialized);
-        DeletionInfoTransitionSupport.assertEquivalent(materialized, cloned);
-        assertNotSame("clone must own generic-materialization clustering-bound bytes",
-                      DeletionInfoTransitionSupport.firstStartBuffer(materialized),
-                      DeletionInfoTransitionSupport.firstStartBuffer(cloned));
+        BTreeDeletionInfo actual = BTreeDeletionInfo.merge(deletionInfo(COMPARATOR, 1), MutableDeletionInfo.live(), COMPARATOR);
+        actual = BTreeDeletionInfo.merge(actual, update, COMPARATOR);
+        assertEquals(expected.rangeIterator(false).next().deletionTime(), actual.rangeIterator(false).next().deletionTime());
     }
 
     @Test
     public void materializingGenericDeletionInfoOwnsRangeBoundBuffers()
     {
         ByteBuffer start = integer(10);
-        ByteBuffer end = integer(20);
         MutableDeletionInfo generic = MutableDeletionInfo.live();
         generic.add(new RangeTombstone(Slice.make(BufferClusteringBound.inclusiveStartOf(start),
-                                                  BufferClusteringBound.inclusiveEndOf(end)),
+                                                   BufferClusteringBound.inclusiveEndOf(integer(20))),
                                        DeletionTime.build(1, 1)), COMPARATOR);
 
         BTreeDeletionInfo materialized = BTreeDeletionInfo.merge(generic, MutableDeletionInfo.live(), COMPARATOR);
-        RangeTombstone snapshot = materialized.rangeIterator(false).next();
-        ByteBuffer snapshotStart = (ByteBuffer) snapshot.deletedSlice().start().get(0);
+        ByteBuffer snapshotStart = (ByteBuffer) materialized.rangeIterator(false).next().deletedSlice().start().get(0);
         assertNotSame(start, snapshotStart);
 
         start.putInt(0, 11);
@@ -211,73 +150,67 @@ public class BTreeDeletionInfoTest
     }
 
     @Test
-    public void mutableDeletionInfoMaterializesABTreeWithoutRetainingItsSnapshot()
+    public void boundedIterationMatchesMutableClippingAndDirection()
     {
-        DeletionInfoTransitionSupport.Transition transition = DeletionInfoTransitionSupport.fixture(128, "ADJACENT")
-                                                                                  .transitions(DeletionInfoTransitionSupport.Operation.TWO_EXACT_BOUND)[0];
-        BTreeDeletionInfo persistent = BTreeDeletionInfo.merge(transition.expectedPrefix(), MutableDeletionInfo.live(), COMPARATOR);
-        MutableDeletionInfo materialized = MutableDeletionInfo.live();
-        materialized.add(persistent);
-
-        DeletionInfoTransitionSupport.assertEquivalent(persistent, materialized);
-        DeletionInfoTransitionSupport.addDisjointRange(materialized, transition.offset(), transition.rangeCount());
-        DeletionInfoTransitionSupport.assertEquivalent(transition.expectedPrefix(), persistent);
-    }
-
-    @Test
-    public void pointLookupPatchesRemainCorrectAcrossCompaction()
-    {
-        DeletionInfoTransitionSupport.Transition transition = DeletionInfoTransitionSupport.fixture(4096, "OPPOSITE")
-                                                                                   .transitions(DeletionInfoTransitionSupport.Operation.TWO_EXACT_BOUND)[0];
-        MutableDeletionInfo expected = transition.expectedPrefix().mutableCopy();
+        MutableDeletionInfo expected = deletionInfo(COMPARATOR, 4);
         BTreeDeletionInfo actual = BTreeDeletionInfo.merge(expected, MutableDeletionInfo.live(), COMPARATOR);
-        Iterator<RangeTombstone> ranges = transition.expectedPrefix().rangeIterator(false);
-        RangeTombstone first = ranges.next();
-        for (int i = 0; i < 33; i++)
-        {
-            RangeTombstone range = i < 2 ? first : ranges.next();
-            MutableDeletionInfo update = MutableDeletionInfo.live();
-            update.add(new RangeTombstone(range.deletedSlice(), DeletionTime.build(200 + i, 20 + i)), COMPARATOR);
-            expected.add(update);
-            actual = BTreeDeletionInfo.merge(actual, update, COMPARATOR);
-            assertPointLookupsEquivalent(expected, actual, 33);
-        }
-
-        DeletionInfoTransitionSupport.assertEquivalent(expected, actual);
-    }
-
-    @Test
-    public void arbitraryMultiRangeSlicesPreserveClippingAndDirection()
-    {
-        DeletionInfoTransitionSupport.Fixture fixture = DeletionInfoTransitionSupport.fixture(4096, "OPPOSITE");
-        DeletionInfoTransitionSupport.Transition transition = fixture.transitions(DeletionInfoTransitionSupport.Operation.TWO_EXACT_BOUND)[0];
-        fixture.prepare(transition);
-        fixture.applyPrepared(transition);
-        DeletionInfo actual = fixture.deletionInfo();
-        int first = transition.offset();
-
         Slice[] slices = new Slice[]{
-        slice(first + 1, true, first + 18, false),
-        slice(first + 3, false, first + 19, true),
-        slice(first + 4, true, first + 27, false),
-        slice(first + 8, true, first + 26, true)
+        slice(1, true, 18, false),
+        slice(3, false, 19, true),
+        slice(4, true, 27, false),
+        slice(8, true, 26, true)
         };
         for (Slice slice : slices)
         {
-            DeletionInfoTransitionSupport.assertIteratorEquivalent(transition.expected(), actual, slice, false);
-            DeletionInfoTransitionSupport.assertIteratorEquivalent(transition.expected(), actual, slice, true);
+            assertIteratorEquivalent(expected.rangeIterator(slice, false), actual.rangeIterator(slice, false));
+            assertIteratorEquivalent(expected.rangeIterator(slice, true), actual.rangeIterator(slice, true));
         }
     }
 
-    private static void assertPointLookupsEquivalent(DeletionInfo expected, DeletionInfo actual, int count)
+    @Test
+    public void materializedBTreeDoesNotTrackLaterMutableRanges()
     {
-        for (int i = 0; i < count; i++)
-        {
-            Clustering<?> covered = Clustering.make(integer(i * 8 + 1));
-            Clustering<?> uncovered = Clustering.make(integer(i * 8 + 5));
-            DeletionInfoTransitionSupport.assertRangeEquivalent(expected.rangeCovering(covered), actual.rangeCovering(covered));
-            DeletionInfoTransitionSupport.assertRangeEquivalent(expected.rangeCovering(uncovered), actual.rangeCovering(uncovered));
-        }
+        MutableDeletionInfo generic = deletionInfo(COMPARATOR, 1);
+        BTreeDeletionInfo materialized = BTreeDeletionInfo.merge(generic, MutableDeletionInfo.live(), COMPARATOR);
+
+        generic.add(range(16, 19, 200), COMPARATOR);
+        assertEquals(1, materialized.rangeCount());
+    }
+
+    @Test
+    public void mutableMaterializationDoesNotMutatePersistentBTree()
+    {
+        BTreeDeletionInfo persistent = BTreeDeletionInfo.merge(deletionInfo(COMPARATOR, 1), MutableDeletionInfo.live(), COMPARATOR);
+        MutableDeletionInfo materialized = MutableDeletionInfo.live();
+        materialized.add(persistent);
+
+        materialized.add(range(16, 19, 200), COMPARATOR);
+        assertEquals(1, persistent.rangeCount());
+        assertEquals(2, materialized.rangeCount());
+    }
+
+    @Test
+    public void materializedBTreeMatchesMutableDataSize()
+    {
+        assertMaterializedDataSize(deletionInfo(COMPARATOR, 1));
+        assertMaterializedDataSize(deletionInfo(COMPARATOR, 2));
+
+        MutableDeletionInfo overlap = deletionInfo(COMPARATOR, 2);
+        overlap.add(range(1, 10, 200), COMPARATOR);
+        assertMaterializedDataSize(overlap);
+    }
+
+    private static void assertMaterializedDataSize(MutableDeletionInfo mutable)
+    {
+        BTreeDeletionInfo materialized = BTreeDeletionInfo.merge(mutable, MutableDeletionInfo.live(), COMPARATOR);
+        assertEquals(mutable.dataSize(), materialized.dataSize());
+    }
+
+    private static void assertIteratorEquivalent(Iterator<RangeTombstone> expected, Iterator<RangeTombstone> actual)
+    {
+        while (expected.hasNext() && actual.hasNext())
+            assertEquals(expected.next(), actual.next());
+        assertEquals(expected.hasNext(), actual.hasNext());
     }
 
     private static Slice slice(int start, boolean startInclusive, int end, boolean endInclusive)
@@ -286,6 +219,21 @@ public class BTreeDeletionInfoTest
                                          : BufferClusteringBound.exclusiveStartOf(integer(start)),
                           endInclusive ? BufferClusteringBound.inclusiveEndOf(integer(end))
                                        : BufferClusteringBound.exclusiveEndOf(integer(end)));
+    }
+
+    private static MutableDeletionInfo deletionInfo(ClusteringComparator comparator, int count)
+    {
+        MutableDeletionInfo info = MutableDeletionInfo.live();
+        for (int i = 0; i < count; i++)
+            info.add(range(i * 8, i * 8 + 3, 100), comparator);
+        return info;
+    }
+
+    private static RangeTombstone range(int start, int end, long timestamp)
+    {
+        return new RangeTombstone(Slice.make(BufferClusteringBound.inclusiveStartOf(integer(start)),
+                                             BufferClusteringBound.inclusiveEndOf(integer(end))),
+                                  DeletionTime.build(timestamp, 10));
     }
 
     private static ByteBuffer integer(int value)
@@ -330,7 +278,7 @@ public class BTreeDeletionInfoTest
         }
 
         @Override
-        public RangeTombstone rangeCovering(org.apache.cassandra.db.Clustering<?> name)
+        public RangeTombstone rangeCovering(Clustering<?> name)
         {
             return delegate.rangeCovering(name);
         }

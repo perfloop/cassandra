@@ -20,6 +20,8 @@ package org.apache.cassandra.db;
 import java.util.Collections;
 import java.util.Iterator;
 
+import com.google.common.base.Objects;
+
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.RangeTombstoneMarker;
@@ -250,32 +252,16 @@ public class MutableDeletionInfo implements DeletionInfo
     @Override
     public boolean equals(Object o)
     {
-        if (this == o)
-            return true;
-        if (!(o instanceof DeletionInfo))
+        if(!(o instanceof MutableDeletionInfo))
             return false;
-
-        DeletionInfo that = (DeletionInfo) o;
-        if (!partitionDeletion.equals(that.getPartitionDeletion()))
-            return false;
-
-        Iterator<RangeTombstone> left = rangeIterator(false);
-        Iterator<RangeTombstone> right = that.rangeIterator(false);
-        while (left.hasNext() && right.hasNext())
-        {
-            if (!left.next().equals(right.next()))
-                return false;
-        }
-        return !left.hasNext() && !right.hasNext();
+        MutableDeletionInfo that = (MutableDeletionInfo)o;
+        return partitionDeletion.equals(that.partitionDeletion) && Objects.equal(ranges, that.ranges);
     }
 
     @Override
     public final int hashCode()
     {
-        int hash = partitionDeletion.hashCode();
-        for (Iterator<RangeTombstone> iterator = rangeIterator(false); iterator.hasNext(); )
-            hash = 31 * hash + iterator.next().hashCode();
-        return hash;
+        return Objects.hashCode(partitionDeletion, ranges);
     }
 
     @Override

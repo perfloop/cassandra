@@ -121,19 +121,33 @@ public final class BTreeDeletionInfo implements DeletionInfo
         DeletionTime partitionDeletion = update.getPartitionDeletion().supersedes(base.partitionDeletion)
                                          ? update.getPartitionDeletion()
                                          : base.partitionDeletion;
-        RangeTree merged = new RangeTree(base.ranges, base.rangeHeapSize);
-        RangeLookup rangeLookup = base.rangeLookup;
+        List<RangeTombstone> updateRanges = new ArrayList<>(update.rangeCount());
         Iterator<RangeTombstone> updates = update.rangeIterator(false);
-        while (updates.hasNext())
+        updates.forEachRemaining(updateRanges::add);
+
+        MergeResult exact = mergeExactRanges(base, updateRanges);
+        RangeTree merged;
+        RangeLookup rangeLookup;
+        if (exact != null)
         {
-            MergeResult result = mergeRange(merged,
-                                            updates.next(),
-                                            base.comparator,
-                                            base.rangeComparator,
-                                            base.lookupComparator,
-                                            rangeLookup);
-            merged = result.ranges;
-            rangeLookup = result.rangeLookup;
+            merged = exact.ranges;
+            rangeLookup = exact.rangeLookup;
+        }
+        else
+        {
+            merged = new RangeTree(base.ranges, base.rangeHeapSize);
+            rangeLookup = base.rangeLookup;
+            for (RangeTombstone updateRange : updateRanges)
+            {
+                MergeResult result = mergeRange(merged,
+                                                updateRange,
+                                                base.comparator,
+                                                base.rangeComparator,
+                                                base.lookupComparator,
+                                                rangeLookup);
+                merged = result.ranges;
+                rangeLookup = result.rangeLookup;
+            }
         }
 
         // Deep trees materialized without a lookup build one once. Later versions retain that
@@ -184,6 +198,56 @@ public final class BTreeDeletionInfo implements DeletionInfo
                                      rangeLookup,
                                      ranges.rangeHeapSize,
                                      treeHeapSize(ranges.ranges, rangeLookup));
+    }
+
+    private static MergeResult mergeExactRanges(BTreeDeletionInfo base, List<RangeTombstone> updates)
+    {
+        if (BTree.isEmpty(base.ranges) && !updates.isEmpty())
+            return null;
+
+        BTree.Builder<RangeTombstone> builder = BTree.builder(base.rangeComparator, updates.size());
+        List<RangeTombstone> previous = new ArrayList<>();
+        List<RangeTombstone> replacements = new ArrayList<>();
+        long rangeHeapSize = base.rangeHeapSize;
+        for (RangeTombstone update : updates)
+        {
+            RangeTombstone existing = (RangeTombstone) BTree.<Object>floor(base.ranges,
+                                                                             base.lookupComparator,
+                                                                             update.deletedSlice().start());
+            if (existing == null || !existing.deletedSlice().equals(update.deletedSlice()))
+                return null;
+
+            // RangeTombstoneList resolves equal bounds by marked timestamp, not local deletion time.
+            if (update.deletionTime().markedForDeleteAt() > existing.deletionTime().markedForDeleteAt())
+            {
+                builder.add(update);
+                previous.add(existing);
+                replacements.add(update);
+                rangeHeapSize += rangeHeapSize(update) - rangeHeapSize(existing);
+            }
+        }
+
+        Object[] replacementTree = builder.build();
+        if (BTree.isEmpty(replacementTree))
+            return new MergeResult(new RangeTree(base.ranges, base.rangeHeapSize), base.rangeLookup);
+
+        RangeLookup rangeLookup = base.rangeLookup;
+        for (int i = 0; i < replacements.size(); i++)
+        {
+            RangeTombstone replacement = replacements.get(i);
+            rangeLookup = RangeLookup.append(rangeLookup,
+                                             Collections.singletonList(previous.get(i)),
+                                             BTree.singleton(replacement),
+                                             replacement,
+                                             base.comparator,
+                                             BTree.depth(base.ranges));
+        }
+        RangeTree merged = new RangeTree(BTree.update(base.ranges,
+                                                       replacementTree,
+                                                       base.rangeComparator,
+                                                       RANGE_UPDATE_FUNCTION),
+                                         rangeHeapSize);
+        return new MergeResult(merged, rangeLookup);
     }
 
     private static MergeResult mergeRange(RangeTree ranges,
@@ -432,6 +496,8 @@ public final class BTreeDeletionInfo implements DeletionInfo
     public int dataSize()
     {
         int size = TypeSizes.sizeof(partitionDeletion.markedForDeleteAt());
+        if (!BTree.isEmpty(ranges))
+            size += TypeSizes.sizeof(BTree.size(ranges));
         for (Iterator<RangeTombstone> iterator = rangeIterator(false); iterator.hasNext(); )
         {
             RangeTombstone range = iterator.next();
@@ -508,55 +574,6 @@ public final class BTreeDeletionInfo implements DeletionInfo
     public long unsharedHeapSize()
     {
         return unsharedHeapSize;
-    }
-
-    @Override
-    public boolean equals(Object other)
-    {
-        if (this == other)
-            return true;
-        if (!(other instanceof DeletionInfo))
-            return false;
-
-        DeletionInfo that = (DeletionInfo) other;
-        if (!partitionDeletion.equals(that.getPartitionDeletion()))
-            return false;
-
-        Iterator<RangeTombstone> left = rangeIterator(false);
-        Iterator<RangeTombstone> right = that.rangeIterator(false);
-        while (left.hasNext() && right.hasNext())
-        {
-            if (!left.next().equals(right.next()))
-                return false;
-        }
-        return !left.hasNext() && !right.hasNext();
-    }
-
-    @Override
-    public int hashCode()
-    {
-        int hash = partitionDeletion.hashCode();
-        for (Iterator<RangeTombstone> iterator = rangeIterator(false); iterator.hasNext(); )
-            hash = 31 * hash + iterator.next().hashCode();
-        return hash;
-    }
-
-    @Override
-    public String toString()
-    {
-        if (BTree.isEmpty(ranges))
-            return String.format("{%s}", partitionDeletion);
-
-        StringBuilder builder = new StringBuilder();
-        builder.append('{').append(partitionDeletion).append(", ranges=");
-        for (Iterator<RangeTombstone> iterator = rangeIterator(false); iterator.hasNext(); )
-        {
-            RangeTombstone range = iterator.next();
-            builder.append(range.deletedSlice().toString(comparator));
-            builder.append('@');
-            builder.append(range.deletionTime());
-        }
-        return builder.append('}').toString();
     }
 
     private static class RangeLookup
