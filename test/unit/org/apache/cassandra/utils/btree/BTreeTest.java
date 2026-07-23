@@ -110,6 +110,20 @@ public class BTreeTest
     }
 
     @Test
+    public void floorWithIndex()
+    {
+        Object[] btree = BTree.build(seq(20));
+        int[] index = new int[1];
+        for (int find = -1; find <= 20; find++)
+        {
+            int expected = find < 0 ? -1 : Math.min(find, 19);
+            Integer floor = BTree.floor(btree, CMP, find, index);
+            assertEquals(expected < 0 ? null : expected, floor);
+            assertEquals(expected, index[0]);
+        }
+    }
+
+    @Test
     public void inOrderAccumulation()
     {
         List<Integer> input = seq(71);

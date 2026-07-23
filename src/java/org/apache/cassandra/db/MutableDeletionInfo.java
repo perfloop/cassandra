@@ -20,8 +20,6 @@ package org.apache.cassandra.db;
 import java.util.Collections;
 import java.util.Iterator;
 
-import com.google.common.base.Objects;
-
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.RangeTombstoneMarker;
@@ -117,6 +115,8 @@ public class MutableDeletionInfo implements DeletionInfo
     {
         if (ranges == null) // Introduce getInitialRangeTombstoneAllocationSize
             ranges = new RangeTombstoneList(comparator, DatabaseDescriptor.getInitialRangeTombstoneListAllocationSize());
+        else if (!ranges.comparator().equals(comparator))
+            throw new IllegalArgumentException("Cannot add a range tombstone with a different clustering comparator");
 
         ranges.add(tombstone);
     }
@@ -130,13 +130,14 @@ public class MutableDeletionInfo implements DeletionInfo
      */
     public DeletionInfo add(DeletionInfo newInfo)
     {
+        if (!(newInfo instanceof MutableDeletionInfo))
+            return add(newInfo.mutableCopy());
+
+        RangeTombstoneList newRanges = ((MutableDeletionInfo) newInfo).ranges;
+        if (ranges != null && newRanges != null && !ranges.comparator().equals(newRanges.comparator()))
+            throw new IllegalArgumentException("Cannot add deletion information with a different clustering comparator");
+
         add(newInfo.getPartitionDeletion());
-
-        // We know MutableDeletionInfo is the only impelementation and we're not mutating it, it's just to get access to the
-        // RangeTombstoneList directly.
-        assert newInfo instanceof MutableDeletionInfo;
-        RangeTombstoneList newRanges = ((MutableDeletionInfo)newInfo).ranges;
-
         if (ranges == null)
             ranges = newRanges == null ? null : newRanges.copy();
         else if (newRanges != null)
@@ -148,6 +149,11 @@ public class MutableDeletionInfo implements DeletionInfo
     public DeletionTime getPartitionDeletion()
     {
         return partitionDeletion;
+    }
+
+    ClusteringComparator rangeComparator()
+    {
+        return ranges == null ? null : ranges.comparator();
     }
 
     // Use sparingly, not the most efficient thing
@@ -244,16 +250,32 @@ public class MutableDeletionInfo implements DeletionInfo
     @Override
     public boolean equals(Object o)
     {
-        if(!(o instanceof MutableDeletionInfo))
+        if (this == o)
+            return true;
+        if (!(o instanceof DeletionInfo))
             return false;
-        MutableDeletionInfo that = (MutableDeletionInfo)o;
-        return partitionDeletion.equals(that.partitionDeletion) && Objects.equal(ranges, that.ranges);
+
+        DeletionInfo that = (DeletionInfo) o;
+        if (!partitionDeletion.equals(that.getPartitionDeletion()))
+            return false;
+
+        Iterator<RangeTombstone> left = rangeIterator(false);
+        Iterator<RangeTombstone> right = that.rangeIterator(false);
+        while (left.hasNext() && right.hasNext())
+        {
+            if (!left.next().equals(right.next()))
+                return false;
+        }
+        return !left.hasNext() && !right.hasNext();
     }
 
     @Override
     public final int hashCode()
     {
-        return Objects.hashCode(partitionDeletion, ranges);
+        int hash = partitionDeletion.hashCode();
+        for (Iterator<RangeTombstone> iterator = rangeIterator(false); iterator.hasNext(); )
+            hash = 31 * hash + iterator.next().hashCode();
+        return hash;
     }
 
     @Override

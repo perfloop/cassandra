@@ -876,8 +876,54 @@ public class BTree
 
     public static <V> V floor(Object[] btree, Comparator<? super V> comparator, V find)
     {
-        int i = floorIndex(btree, comparator, find);
-        return i >= 0 ? findByIndex(btree, i) : null;
+        return floor(btree, comparator, find, null);
+    }
+
+    /**
+     * Finds the greatest value that is less than or equal to {@code find}. If {@code index} is not
+     * null, its first element is set to the flattened-tree index of the returned value, or -1 when
+     * no floor exists.
+     */
+    public static <V> V floor(Object[] btree, Comparator<? super V> comparator, V find, int[] index)
+    {
+        int lowerBound = 0;
+        int floorIndex = -1;
+        V floor = null;
+        while (true)
+        {
+            int keyEnd = getKeyEnd(btree);
+            int i = Arrays.binarySearch((V[]) btree, 0, keyEnd, find, comparator);
+            if (i >= 0)
+            {
+                if (index != null)
+                    index[0] = isLeaf(btree) ? lowerBound + i : lowerBound + sizeMap(btree)[i];
+                return (V) btree[i];
+            }
+
+            i = -1 - i;
+            if (isLeaf(btree))
+            {
+                if (i > 0)
+                {
+                    if (index != null)
+                        index[0] = lowerBound + i - 1;
+                    return (V) btree[i - 1];
+                }
+
+                if (index != null)
+                    index[0] = floorIndex;
+                return floor;
+            }
+
+            int[] sizeMap = sizeMap(btree);
+            if (i > 0)
+            {
+                floor = (V) btree[i - 1];
+                floorIndex = lowerBound + sizeMap[i - 1];
+                lowerBound += sizeMap[i - 1] + 1;
+            }
+            btree = (Object[]) btree[keyEnd + i];
+        }
     }
 
     public static <V> int higherIndex(Object[] btree, Comparator<? super V> comparator, V find)
