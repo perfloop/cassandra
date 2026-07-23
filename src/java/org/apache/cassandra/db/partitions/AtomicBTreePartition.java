@@ -192,9 +192,7 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
             if (existing instanceof ImmutableBTreeDeletionInfo)
             {
                 ImmutableBTreeDeletionInfo immutable = (ImmutableBTreeDeletionInfo) existing;
-                newInfo = update.hasRanges()
-                          ? immutable.append(update.rangeIterator(false).next(), maxDeletion(existing, update), rangeTombstoneUpdater)
-                          : immutable.withPartitionDeletion(update.getPartitionDeletion());
+                newInfo = immutable.append(update.rangeIterator(false).next(), maxDeletion(existing, update), rangeTombstoneUpdater);
             }
             else
             {
@@ -210,18 +208,12 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
 
         private static boolean canUseImmutableRanges(DeletionInfo existing, DeletionInfo update)
         {
-            if (existing instanceof ImmutableBTreeDeletionInfo)
-            {
-                if (!update.hasRanges())
-                    return true;
+            if (update.rangeCount() != 1)
+                return false;
 
-                if (update.rangeCount() != 1)
-                    return false;
-
-                return ((ImmutableBTreeDeletionInfo) existing).canAppend(update.rangeIterator(false).next());
-            }
-
-            return !existing.hasRanges() && update.rangeCount() == 1;
+            return existing instanceof ImmutableBTreeDeletionInfo
+                   ? ((ImmutableBTreeDeletionInfo) existing).canAppend(update.rangeIterator(false).next())
+                   : !existing.hasRanges();
         }
 
         private static DeletionTime maxDeletion(DeletionInfo existing, DeletionInfo update)

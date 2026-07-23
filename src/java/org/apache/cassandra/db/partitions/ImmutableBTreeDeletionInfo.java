@@ -90,14 +90,6 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
         return new ImmutableBTreeDeletionInfo(comparator, newPartitionDeletion, updated);
     }
 
-    ImmutableBTreeDeletionInfo withPartitionDeletion(DeletionTime deletion)
-    {
-        if (!deletion.supersedes(partitionDeletion))
-            return this;
-
-        return new ImmutableBTreeDeletionInfo(comparator, deletion, ranges);
-    }
-
     @Override
     public boolean isLive()
     {
