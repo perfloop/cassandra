@@ -46,7 +46,7 @@ import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 import org.apache.cassandra.utils.concurrent.OpOrder;
-import org.apache.cassandra.utils.memory.ByteBufferCloner;
+import org.apache.cassandra.utils.memory.HeapCloner;
 import org.apache.cassandra.utils.memory.HeapPool;
 import org.apache.cassandra.utils.memory.MemtableAllocator;
 
@@ -176,14 +176,7 @@ public final class DeletionInfoTransitionSupport
 
     public static DeletionInfo deepClone(DeletionInfo info)
     {
-        return info.clone(new ByteBufferCloner()
-        {
-            @Override
-            public ByteBuffer allocate(int size)
-            {
-                return ByteBuffer.allocate(size);
-            }
-        });
+        return info.clone(HeapCloner.instance);
     }
 
     public static ByteBuffer firstStartBuffer(DeletionInfo info)
