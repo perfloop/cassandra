@@ -18,6 +18,8 @@
 
 package org.apache.cassandra.db.partitions;
 
+import org.apache.cassandra.db.BTreeDeletionInfo;
+import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.DeletionInfo;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.rows.Cell;
@@ -30,7 +32,6 @@ import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.btree.UpdateFunction;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.Cloner;
-import org.apache.cassandra.utils.memory.HeapCloner;
 import org.apache.cassandra.utils.memory.MemtableAllocator;
 
 /**
@@ -114,7 +115,7 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
             contextCloner = cloner;
         }
 
-        DeletionInfo newDeletionInfo = merge(current.deletionInfo, update.deletionInfo());
+        DeletionInfo newDeletionInfo = merge(current.deletionInfo, update.deletionInfo(), update.metadata().comparator);
 
         RegularAndStaticColumns columns = current.columns;
         RegularAndStaticColumns newColumns = update.columns().mergeTo(columns);
@@ -138,7 +139,7 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
         return merge(current, update);
     }
 
-    private DeletionInfo merge(DeletionInfo existing, DeletionInfo update)
+    private DeletionInfo merge(DeletionInfo existing, DeletionInfo update, ClusteringComparator comparator)
     {
         if (update.isLive() || !update.mayModify(existing))
             return existing;
@@ -149,10 +150,9 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
         if (update.hasRanges())
             update.rangeIterator(false).forEachRemaining(indexer::onRangeTombstone);
 
-        // Like for rows, we have to clone the update in case internal buffers (when it has range tombstones) reference
-        // memory we shouldn't hold into. But we don't ever store this off-heap currently so we just default to the
-        // HeapAllocator (rather than using 'allocator').
-        DeletionInfo newInfo = existing.mutableCopy().add(update.clone(HeapCloner.instance));
+        // Range bounds in the update are cloned by BTreeDeletionInfo before they are retained. The immutable tree
+        // then shares the unaffected part of the existing version instead of copying every range-array slot.
+        DeletionInfo newInfo = BTreeDeletionInfo.merge(existing, update, comparator);
         onAllocatedOnHeap(newInfo.unsharedHeapSize() - existing.unsharedHeapSize());
         return newInfo;
     }

@@ -37,6 +37,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.Ordering;
 
+import accord.utils.AsymmetricComparator;
 import accord.utils.Invariants;
 
 import org.apache.cassandra.utils.BiLongAccumulator;
@@ -872,6 +873,39 @@ public class BTree
         if (i < 0)
             i = -2 - i;
         return i;
+    }
+
+    /**
+     * Returns the flattened index of the largest tree value no greater than {@code find}, or {@code -1} when none
+     * exists, using an asymmetric comparator to avoid constructing a search value of the tree's type.
+     */
+    public static <K, V> int floorIndex(Object[] node, AsymmetricComparator<? super K, ? super V> comparator, K find)
+    {
+        int lb = 0;
+        while (true)
+        {
+            int keyEnd = getKeyEnd(node);
+            int low = 0;
+            int high = keyEnd - 1;
+            while (low <= high)
+            {
+                int mid = (low + high) >>> 1;
+                int comparison = comparator.compare(find, (V) node[mid]);
+                if (comparison > 0)
+                    low = mid + 1;
+                else if (comparison < 0)
+                    high = mid - 1;
+                else
+                    return isLeaf(node) ? lb + mid : lb + sizeMap(node)[mid];
+            }
+
+            if (isLeaf(node))
+                return lb + low - 1;
+
+            if (low > 0)
+                lb += sizeMap(node)[low - 1] + 1;
+            node = (Object[]) node[keyEnd + low];
+        }
     }
 
     public static <V> V floor(Object[] btree, Comparator<? super V> comparator, V find)

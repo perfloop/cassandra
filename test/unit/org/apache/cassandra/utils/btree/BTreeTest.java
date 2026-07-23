@@ -30,6 +30,8 @@ import com.google.common.collect.Iterables;
 import org.junit.Assert;
 import org.junit.Test;
 
+import accord.utils.AsymmetricComparator;
+
 import static org.apache.cassandra.config.CassandraRelevantProperties.BTREE_BRANCH_SHIFT;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -82,6 +84,20 @@ public class BTreeTest
     }
 
     private static final Comparator<Integer> CMP = Integer::compare;
+
+    @Test
+    public void floorSearchesFindTheLastPrecedingValue()
+    {
+        Object[] tree = BTree.build(seq(100));
+        AsymmetricComparator<Integer, Integer> asymmetric = Integer::compare;
+        for (int search = -1; search <= 100; search++)
+        {
+            int expectedIndex = search < 0 ? -1 : Math.min(search, 99);
+            assertEquals(expectedIndex, BTree.floorIndex(tree, CMP, search));
+            assertEquals(expectedIndex, BTree.floorIndex(tree, asymmetric, search));
+            assertEquals(expectedIndex < 0 ? null : expectedIndex, BTree.floor(tree, CMP, search));
+        }
+    }
 
     @Test
     public void testBuilding_UpdateFunctionReplacement()

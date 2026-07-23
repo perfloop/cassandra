@@ -49,27 +49,37 @@ public class FastByteOperations
 
     public static int compareUnsigned(ByteBuffer b1, byte[] b2, int s2, int l2)
     {
-        return BestHolder.BEST.compare(b1, b2, s2, l2);
+        return b1.isReadOnly()
+               ? PureJavaOperations.INSTANCE.compare(b1, b2, s2, l2)
+               : BestHolder.BEST.compare(b1, b2, s2, l2);
     }
 
     public static int compareUnsigned(byte[] b1, int s1, int l1, ByteBuffer b2)
     {
-        return -BestHolder.BEST.compare(b2, b1, s1, l1);
+        return b2.isReadOnly()
+               ? -PureJavaOperations.INSTANCE.compare(b2, b1, s1, l1)
+               : -BestHolder.BEST.compare(b2, b1, s1, l1);
     }
 
     public static int compareUnsigned(ByteBuffer b1, int s1, int l1, byte[] b2, int s2, int l2)
     {
-        return BestHolder.BEST.compare(b1, s1, l1, b2, s2, l2);
+        return b1.isReadOnly()
+               ? PureJavaOperations.INSTANCE.compare(b1, s1, l1, b2, s2, l2)
+               : BestHolder.BEST.compare(b1, s1, l1, b2, s2, l2);
     }
 
     public static int compareUnsigned(byte[] b1, int s1, int l1, ByteBuffer b2, int s2, int l2)
     {
-        return -BestHolder.BEST.compare(b2, s2, l2, b1, s1, l1);
+        return b2.isReadOnly()
+               ? -PureJavaOperations.INSTANCE.compare(b2, s2, l2, b1, s1, l1)
+               : -BestHolder.BEST.compare(b2, s2, l2, b1, s1, l1);
     }
 
     public static int compareUnsigned(ByteBuffer b1, ByteBuffer b2)
     {
-        return BestHolder.BEST.compare(b1, b2);
+        return b1.isReadOnly() || b2.isReadOnly()
+               ? PureJavaOperations.INSTANCE.compare(b1, b2)
+               : BestHolder.BEST.compare(b1, b2);
     }
 
     public static int compareWithMemoryUnsigned(ByteBuffer b1, long address2, int length2)
@@ -479,6 +489,9 @@ public class FastByteOperations
     @SuppressWarnings("unused")
     public static final class PureJavaOperations implements ByteOperations
     {
+        // Unsafe operations cannot locate the backing array of a read-only heap buffer.
+        private static final PureJavaOperations INSTANCE = new PureJavaOperations();
+
         @Override
         public int compare(byte[] buffer1, int offset1, int length1,
                            byte[] buffer2, int offset2, int length2)

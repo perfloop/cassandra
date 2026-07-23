@@ -27,13 +27,11 @@ import org.apache.cassandra.utils.memory.ByteBufferCloner;
  * A combination of a top-level (partition) tombstone and range tombstones describing the deletions
  * within a partition.
  * <p>
- * Note that in practice {@link MutableDeletionInfo} is the only concrete implementation of this, however
- * different parts of the code will return either {@code DeletionInfo} or {@code MutableDeletionInfo} based
- * on whether it can/should be mutated or not.
+ * {@link MutableDeletionInfo} is the mutable implementation; callers receive {@code DeletionInfo} when the
+ * value may instead be immutable.
  * <p>
- * <b>Warning:</b> do not ever cast a {@code DeletionInfo} into a {@code MutableDeletionInfo} to mutate it!!!
- * TODO: it would be safer to have 2 actual implementation of DeletionInfo, one mutable and one that isn't (I'm
- * just lazy right this minute).
+ * <b>Warning:</b> do not ever cast a {@code DeletionInfo} into a {@code MutableDeletionInfo} to mutate it; use
+ * {@link #mutableCopy()} instead.
  */
 public interface DeletionInfo extends IMeasurableMemory
 {

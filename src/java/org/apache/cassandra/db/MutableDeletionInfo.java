@@ -72,6 +72,14 @@ public class MutableDeletionInfo implements DeletionInfo
     }
 
     /**
+     * Returns the ordering authority for this instance's retained range bounds.
+     */
+    ClusteringComparator rangeComparator()
+    {
+        return ranges == null ? null : ranges.comparator();
+    }
+
+    /**
      * Returns a new DeletionInfo that has no top-level tombstone or any range tombstones.
      */
     public static MutableDeletionInfo live()
@@ -124,23 +132,45 @@ public class MutableDeletionInfo implements DeletionInfo
     /**
      * Combines another DeletionInfo with this one and returns the result.  Whichever top-level tombstone
      * has the higher markedForDeleteAt timestamp will be kept, along with its localDeletionTime.  The
-     * range tombstones will be combined.
+     * range tombstones will be combined. Range-bearing values must use equal clustering comparators.
      *
      * @return this object.
      */
     public DeletionInfo add(DeletionInfo newInfo)
     {
+        RangeTombstoneList newRanges;
+        if (newInfo instanceof MutableDeletionInfo)
+        {
+            newRanges = ((MutableDeletionInfo) newInfo).ranges;
+        }
+        else if (newInfo.hasRanges())
+        {
+            // Immutable implementations cannot expose mutable backing storage; materialize a private copy first.
+            newRanges = newInfo.mutableCopy().ranges;
+        }
+        else
+        {
+            newRanges = null;
+        }
+
+        if (ranges != null && !ranges.isEmpty() && newRanges != null && !newRanges.isEmpty()
+            && !ranges.comparator().equals(newRanges.comparator()))
+            throw new IllegalArgumentException("Cannot merge deletion infos with different clustering comparators");
+
         add(newInfo.getPartitionDeletion());
-
-        // We know MutableDeletionInfo is the only impelementation and we're not mutating it, it's just to get access to the
-        // RangeTombstoneList directly.
-        assert newInfo instanceof MutableDeletionInfo;
-        RangeTombstoneList newRanges = ((MutableDeletionInfo)newInfo).ranges;
-
         if (ranges == null)
+        {
             ranges = newRanges == null ? null : newRanges.copy();
+        }
         else if (newRanges != null)
-            ranges.addAll(newRanges);
+        {
+            if (ranges.isEmpty())
+                ranges = newRanges.copy();
+            else
+            {
+                ranges.addAll(newRanges);
+            }
+        }
 
         return this;
     }
