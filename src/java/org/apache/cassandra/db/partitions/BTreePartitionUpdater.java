@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.db.partitions;
 
+import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.DeletionInfo;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.rows.Cell;
@@ -114,7 +115,7 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
             contextCloner = cloner;
         }
 
-        DeletionInfo newDeletionInfo = merge(current.deletionInfo, update.deletionInfo());
+        DeletionInfo newDeletionInfo = merge(current.deletionInfo, update.deletionInfo(), update.metadata().comparator);
 
         RegularAndStaticColumns columns = current.columns;
         RegularAndStaticColumns newColumns = update.columns().mergeTo(columns);
@@ -138,7 +139,7 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
         return merge(current, update);
     }
 
-    private DeletionInfo merge(DeletionInfo existing, DeletionInfo update)
+    protected DeletionInfo merge(DeletionInfo existing, DeletionInfo update, ClusteringComparator comparator)
     {
         if (update.isLive() || !update.mayModify(existing))
             return existing;

@@ -28,8 +28,11 @@ import org.github.jamm.Unmetered;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionInfo;
+import org.apache.cassandra.db.DeletionTime;
+import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.Row;
@@ -38,6 +41,7 @@ import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.ObjectSizes;
+import org.apache.cassandra.utils.btree.UpdateFunction;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.Cloner;
 import org.apache.cassandra.utils.memory.MemtableAllocator;
@@ -146,6 +150,85 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
         public Updater(MemtableAllocator allocator, Cloner cloner, OpOrder.Group writeOp, UpdateTransaction indexer)
         {
             super(allocator, cloner, writeOp, indexer);
+        }
+
+        private final UpdateFunction<RangeTombstone, RangeTombstone> rangeTombstoneUpdater = new UpdateFunction<RangeTombstone, RangeTombstone>()
+        {
+            @Override
+            public RangeTombstone insert(RangeTombstone range)
+            {
+                onAllocatedOnHeap(ImmutableBTreeDeletionInfo.rangeTombstoneHeapSize(range));
+                return range;
+            }
+
+            @Override
+            public RangeTombstone merge(RangeTombstone existing, RangeTombstone update)
+            {
+                return update;
+            }
+
+            @Override
+            public void onAllocatedOnHeap(long heapSize)
+            {
+                Updater.this.onAllocatedOnHeap(heapSize);
+            }
+        };
+
+        @Override
+        protected DeletionInfo merge(DeletionInfo existing, DeletionInfo update, ClusteringComparator comparator)
+        {
+            if (update.isLive() || !update.mayModify(existing))
+                return existing;
+
+            if (!canUseImmutableRanges(existing, update))
+                return super.merge(existing, update, comparator);
+
+            if (!update.getPartitionDeletion().isLive())
+                indexer.onPartitionDeletion(update.getPartitionDeletion());
+            if (update.hasRanges())
+                update.rangeIterator(false).forEachRemaining(indexer::onRangeTombstone);
+
+            DeletionInfo newInfo;
+            if (existing instanceof ImmutableBTreeDeletionInfo)
+            {
+                ImmutableBTreeDeletionInfo immutable = (ImmutableBTreeDeletionInfo) existing;
+                newInfo = update.hasRanges()
+                          ? immutable.append(update.rangeIterator(false).next(), maxDeletion(existing, update), rangeTombstoneUpdater)
+                          : immutable.withPartitionDeletion(update.getPartitionDeletion());
+            }
+            else
+            {
+                newInfo = ImmutableBTreeDeletionInfo.create(comparator,
+                                                            maxDeletion(existing, update),
+                                                            update.rangeIterator(false).next(),
+                                                            rangeTombstoneUpdater);
+            }
+
+            onAllocatedOnHeap(newInfo.unsharedHeapSize() - existing.unsharedHeapSize());
+            return newInfo;
+        }
+
+        private static boolean canUseImmutableRanges(DeletionInfo existing, DeletionInfo update)
+        {
+            if (existing instanceof ImmutableBTreeDeletionInfo)
+            {
+                if (!update.hasRanges())
+                    return true;
+
+                if (update.rangeCount() != 1)
+                    return false;
+
+                return ((ImmutableBTreeDeletionInfo) existing).canAppend(update.rangeIterator(false).next());
+            }
+
+            return !existing.hasRanges() && update.rangeCount() == 1;
+        }
+
+        private static DeletionTime maxDeletion(DeletionInfo existing, DeletionInfo update)
+        {
+            return update.getPartitionDeletion().supersedes(existing.getPartitionDeletion())
+                   ? update.getPartitionDeletion()
+                   : existing.getPartitionDeletion();
         }
 
         Updater addAll(final PartitionUpdate update)

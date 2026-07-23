@@ -132,10 +132,11 @@ public class MutableDeletionInfo implements DeletionInfo
     {
         add(newInfo.getPartitionDeletion());
 
-        // We know MutableDeletionInfo is the only impelementation and we're not mutating it, it's just to get access to the
-        // RangeTombstoneList directly.
-        assert newInfo instanceof MutableDeletionInfo;
-        RangeTombstoneList newRanges = ((MutableDeletionInfo)newInfo).ranges;
+        // A published immutable deletion info materializes at this existing mutable composition boundary.
+        MutableDeletionInfo mutableNewInfo = newInfo instanceof MutableDeletionInfo
+                                            ? (MutableDeletionInfo) newInfo
+                                            : newInfo.mutableCopy();
+        RangeTombstoneList newRanges = mutableNewInfo.ranges;
 
         if (ranges == null)
             ranges = newRanges == null ? null : newRanges.copy();
@@ -244,16 +245,36 @@ public class MutableDeletionInfo implements DeletionInfo
     @Override
     public boolean equals(Object o)
     {
-        if(!(o instanceof MutableDeletionInfo))
+        if (!(o instanceof DeletionInfo))
             return false;
-        MutableDeletionInfo that = (MutableDeletionInfo)o;
-        return partitionDeletion.equals(that.partitionDeletion) && Objects.equal(ranges, that.ranges);
+
+        DeletionInfo that = (DeletionInfo) o;
+        if (!partitionDeletion.equals(that.getPartitionDeletion()) || rangeCount() != that.rangeCount())
+            return false;
+
+        Iterator<RangeTombstone> left = rangeIterator(false);
+        Iterator<RangeTombstone> right = that.rangeIterator(false);
+        while (left.hasNext())
+        {
+            if (!left.next().equals(right.next()))
+                return false;
+        }
+        return !right.hasNext();
     }
 
     @Override
     public final int hashCode()
     {
-        return Objects.hashCode(partitionDeletion, ranges);
+        int result = rangeCount();
+        for (Iterator<RangeTombstone> iterator = rangeIterator(false); iterator.hasNext(); )
+        {
+            RangeTombstone range = iterator.next();
+            long markedAt = range.deletionTime().markedForDeleteAt();
+            result += range.deletedSlice().start().hashCode() + range.deletedSlice().end().hashCode();
+            result += (int) (markedAt ^ (markedAt >>> 32));
+            result += range.deletionTime().localDeletionTimeUnsignedInteger();
+        }
+        return Objects.hashCode(partitionDeletion, result);
     }
 
     @Override
