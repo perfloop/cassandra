@@ -188,7 +188,7 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
             if (update.hasRanges())
                 update.rangeIterator(false).forEachRemaining(indexer::onRangeTombstone);
 
-            DeletionInfo newInfo;
+            ImmutableBTreeDeletionInfo newInfo;
             if (existing instanceof ImmutableBTreeDeletionInfo)
             {
                 ImmutableBTreeDeletionInfo immutable = (ImmutableBTreeDeletionInfo) existing;
@@ -202,7 +202,9 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
                                                             rangeTombstoneUpdater);
             }
 
-            onAllocatedOnHeap(newInfo.unsharedHeapSize() - existing.unsharedHeapSize());
+            // BTree callbacks charge newly allocated nodes and range payloads. Every published version also
+            // allocates a wrapper; only an unchanged partition-deletion object is retained from the prior version.
+            onAllocatedOnHeap(newInfo.wrapperAllocationSize(existing));
             return newInfo;
         }
 

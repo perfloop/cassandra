@@ -17,6 +17,7 @@
 
 package org.apache.cassandra.db.partitions;
 
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
 
@@ -114,16 +115,30 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
         if (slice == Slice.ALL)
             return rangeIterator(reversed);
 
-        Iterator<RangeTombstone> iterator = rangeIterator(reversed);
+        if (BTree.isEmpty(ranges))
+            return Collections.emptyIterator();
+
+        int rangeCount = BTree.size(ranges);
+        int first = reversed
+                    ? Math.min(rangeCount - 1, BTree.ceilIndex(ranges, rangeComparator(), slice.end()))
+                    : Math.max(0, BTree.floorIndex(ranges, rangeComparator(), slice.start()));
         return new AbstractIterator<RangeTombstone>()
         {
+            private int index = first;
+
             @Override
             protected RangeTombstone computeNext()
             {
-                while (iterator.hasNext())
+                while (index >= 0 && index < rangeCount)
                 {
-                    RangeTombstone range = iterator.next();
+                    RangeTombstone range = BTree.findByIndex(ranges, index);
+                    index += reversed ? -1 : 1;
                     Slice rangeSlice = range.deletedSlice();
+                    if (reversed
+                        ? comparator.compare(rangeSlice.end(), slice.start()) < 0
+                        : comparator.compare(rangeSlice.start(), slice.end()) > 0)
+                        return endOfData();
+
                     if (!rangeSlice.intersects(comparator, slice))
                         continue;
 
@@ -228,9 +243,21 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
     @Override
     public long unsharedHeapSize()
     {
-        // BTree nodes and range payloads are accounted at their allocation site through the updater callback.
-        // A version only owns this wrapper and its partition deletion; the BTree itself is shared by versions.
+        long size = wrapperHeapSize() + BTree.sizeOnHeapOf(ranges);
+        for (RangeTombstone range : BTree.<RangeTombstone>iterable(ranges))
+            size += rangeTombstoneHeapSize(range);
+        return size;
+    }
+
+    long wrapperHeapSize()
+    {
         return EMPTY_SIZE + partitionDeletion.unsharedHeapSize();
+    }
+
+    long wrapperAllocationSize(DeletionInfo previous)
+    {
+        return EMPTY_SIZE
+               + (partitionDeletion == previous.getPartitionDeletion() ? 0 : partitionDeletion.unsharedHeapSize());
     }
 
     @Override

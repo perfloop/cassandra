@@ -19,7 +19,9 @@
 package org.apache.cassandra.db;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Random;
 import java.util.function.Consumer;
 import java.util.regex.Matcher;
@@ -32,9 +34,22 @@ import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.partitions.AtomicBTreePartition;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.distributed.shared.ThrowingRunnable;
+import org.apache.cassandra.index.transactions.UpdateTransaction;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.ObjectSizes;
+import org.apache.cassandra.utils.btree.BTree;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.utils.memory.HeapCloner;
+import org.apache.cassandra.utils.memory.HeapPool;
+import org.apache.cassandra.utils.memory.MemtableAllocator;
 
 import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 import static org.junit.Assert.assertEquals;
@@ -577,6 +592,93 @@ public class RangeTombstoneListTest
     }
 
     @Test
+    public void publishedBTreeDeletionInfoMatchesBoundedMutableSlicesAndMaterializesIndependently()
+    {
+        TableMetadata metadata = TableMetadata.builder("range_tombstone_test", "published_deletion_info")
+                                              .addPartitionKeyColumn("pk", Int32Type.instance)
+                                              .addClusteringColumn("ck", Int32Type.instance)
+                                              .build();
+        TableMetadataRef metadataRef = TableMetadataRef.forOfflineTools(metadata);
+        DatabaseDescriptor.setPartitionerUnsafe(ByteOrderedPartitioner.instance);
+        DecoratedKey partitionKey = new BufferDecoratedKey(ByteOrderedPartitioner.instance.getToken(Int32Type.instance.decompose(0)),
+                                                           Int32Type.instance.decompose(0));
+        HeapPool pool = new HeapPool(Long.MAX_VALUE, 1.0f, () -> ImmediateFuture.success(Boolean.TRUE));
+        MemtableAllocator allocator = new HeapPool.Allocator(pool);
+        AtomicBTreePartition partition = new AtomicBTreePartition(metadataRef, partitionKey, allocator);
+        OpOrder order = new OpOrder();
+        RangeTombstoneList expectedRanges = new RangeTombstoneList(cmp, 128);
+
+        try
+        {
+            DeletionInfo first = null;
+            long firstHeapSize = 0;
+            for (int i = 0; i < 128; i++)
+            {
+                long timestamp = i + 1L;
+                PartitionUpdate update = rangeUpdate(metadata, i, timestamp, i == 0);
+                OpOrder.Group writeOp = order.getCurrent();
+                partition.addAll(update, allocator.cloner(writeOp), writeOp, UpdateTransaction.NO_OP);
+                expectedRanges.add(rt(i * 4, i * 4 + 2, timestamp, 1));
+                if (i == 0)
+                {
+                    first = partition.deletionInfo();
+                    RangeTombstone firstRange = first.rangeIterator(false).next();
+                    firstHeapSize = first.unsharedHeapSize();
+                    assertTrue(firstHeapSize >= rangeTombstoneHeapSize(firstRange)
+                                             + BTree.sizeOnHeapOf(BTree.singleton(firstRange)));
+                }
+            }
+
+            DeletionInfo published = partition.deletionInfo();
+            MutableDeletionInfo expected = new MutableDeletionInfo(DeletionTime.build(1, 1), expectedRanges);
+            assertEquals(expected, published);
+            assertEquals(published, expected);
+            assertEquals(firstHeapSize, first.unsharedHeapSize());
+            assertTrue(published.unsharedHeapSize() >= retainedRangeBytes(published));
+            assertTrue(published.unsharedHeapSize() > firstHeapSize);
+
+            Slice[] slices = new Slice[]
+            {
+            Slice.make(ClusteringBound.create(cmp, true, true, 0), ClusteringBound.create(cmp, false, true, 2)),
+            Slice.make(ClusteringBound.create(cmp, true, false, 4), ClusteringBound.create(cmp, false, false, 10)),
+            Slice.make(ClusteringBound.create(cmp, true, true, 252), ClusteringBound.create(cmp, false, false, 258)),
+            Slice.make(ClusteringBound.create(cmp, true, false, 509), ClusteringBound.create(cmp, false, true, 511)),
+            Slice.make(clustering(253)),
+            Slice.make(clustering(255))
+            };
+            for (Slice slice : slices)
+            {
+                assertRangeIteratorEquals(expected.rangeIterator(slice, false), published.rangeIterator(slice, false));
+                assertRangeIteratorEquals(expected.rangeIterator(slice, true), published.rangeIterator(slice, true));
+            }
+
+            MutableDeletionInfo composed = (MutableDeletionInfo) MutableDeletionInfo.live().add(published);
+            MutableDeletionInfo cloned = (MutableDeletionInfo) published.clone(HeapCloner.instance);
+            assertEquals(published, composed);
+            assertEquals(published, cloned);
+
+            composed.updateAllTimestampAndLocalDeletionTime(10_000, 10_001);
+            assertEquals(1L, published.getPartitionDeletion().markedForDeleteAt());
+            assertEquals(1L, published.rangeIterator(false).next().deletionTime().markedForDeleteAt());
+            assertEquals(1L, cloned.getPartitionDeletion().markedForDeleteAt());
+            assertEquals(1L, cloned.rangeIterator(false).next().deletionTime().markedForDeleteAt());
+
+            cloned.updateAllTimestampAndLocalDeletionTime(20_000, 20_001);
+            assertEquals(20_000L, cloned.getPartitionDeletion().markedForDeleteAt());
+            assertEquals(20_000L, cloned.rangeIterator(false).next().deletionTime().markedForDeleteAt());
+            assertEquals(10_000L, composed.getPartitionDeletion().markedForDeleteAt());
+            assertEquals(10_000L, composed.rangeIterator(false).next().deletionTime().markedForDeleteAt());
+            assertEquals(1L, published.getPartitionDeletion().markedForDeleteAt());
+            assertEquals(1L, published.rangeIterator(false).next().deletionTime().markedForDeleteAt());
+        }
+        finally
+        {
+            allocator.setDiscarding();
+            allocator.setDiscarded();
+        }
+    }
+
+    @Test
     public void testSetResizeFactor()
     {
         double original = DatabaseDescriptor.getRangeTombstoneListGrowthFactor();
@@ -640,6 +742,45 @@ public class RangeTombstoneListTest
         {
             verifier.accept(throwable);
         }
+    }
+
+    private static long retainedRangeBytes(DeletionInfo info)
+    {
+        long size = 0;
+        Iterator<RangeTombstone> ranges = info.rangeIterator(false);
+        while (ranges.hasNext())
+            size += rangeTombstoneHeapSize(ranges.next());
+        return size;
+    }
+
+    private static long rangeTombstoneHeapSize(RangeTombstone range)
+    {
+        Slice slice = range.deletedSlice();
+        return ObjectSizes.measure(new RangeTombstone(Slice.ALL, DeletionTime.LIVE))
+               + (slice == Slice.ALL ? 0 : ObjectSizes.measure(Slice.ALL))
+               + slice.start().unsharedHeapSize()
+               + slice.end().unsharedHeapSize()
+               + range.deletionTime().unsharedHeapSize();
+    }
+
+    private static void assertRangeIteratorEquals(Iterator<RangeTombstone> expected, Iterator<RangeTombstone> actual)
+    {
+        List<RangeTombstone> expectedRanges = new ArrayList<>();
+        List<RangeTombstone> actualRanges = new ArrayList<>();
+        expected.forEachRemaining(expectedRanges::add);
+        actual.forEachRemaining(actualRanges::add);
+        assertEquals(expectedRanges, actualRanges);
+    }
+
+    private static PartitionUpdate rangeUpdate(TableMetadata metadata, int range, long timestamp, boolean deletePartition)
+    {
+        PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(metadata, 0)
+                                                              .timestamp(timestamp)
+                                                              .nowInSec(1);
+        if (deletePartition)
+            builder.delete();
+        builder.addRangeTombstone().start(range * 4).end(range * 4 + 2);
+        return builder.build();
     }
 
     private static void assertRT(RangeTombstone expected, RangeTombstone actual)
