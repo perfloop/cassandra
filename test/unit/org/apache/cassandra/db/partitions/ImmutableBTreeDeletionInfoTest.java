@@ -129,6 +129,35 @@ public class ImmutableBTreeDeletionInfoTest
     }
 
     @Test
+    public void supersedingPartitionDeletionsChargeOnlyTheNewStateDelta()
+    {
+        Fixture fixture = new Fixture();
+        Fixture rebuilt = new Fixture();
+        try
+        {
+            for (int i = 0; i < 2; i++)
+            {
+                assertLedger(fixture, fixture.rangeUpdate(i * 4, i * 4 + 2, i + 1L));
+                assertLedger(rebuilt, rebuilt.rangeUpdate(i * 4, i * 4 + 2, i + 1L));
+            }
+
+            BTreePartitionUpdater first = assertLedger(fixture, fixture.partitionDelete(100L));
+            BTreePartitionUpdater second = assertLedger(fixture, fixture.partitionDelete(200L));
+            assertEquals(DeletionTime.build(100L, LOCAL_DELETION_TIME).unsharedHeapSize(), first.heapSize);
+            assertEquals(0, second.heapSize);
+
+            assertLedger(rebuilt, rebuilt.partitionDelete(200L));
+            assertEquals(rebuilt.partition.deletionInfo().unsharedHeapSize(), fixture.partition.deletionInfo().unsharedHeapSize());
+            assertEquals(200L, fixture.partition.deletionInfo().getPartitionDeletion().markedForDeleteAt());
+        }
+        finally
+        {
+            fixture.close();
+            rebuilt.close();
+        }
+    }
+
+    @Test
     public void overlappingRangeFallsBackToCanonicalMutableReconciliation()
     {
         Fixture fixture = new Fixture();
@@ -189,11 +218,12 @@ public class ImmutableBTreeDeletionInfoTest
         }
     }
 
-    private static void assertLedger(Fixture fixture, PartitionUpdate update)
+    private static BTreePartitionUpdater assertLedger(Fixture fixture, PartitionUpdate update)
     {
         long before = fixture.allocator.onHeap().owns();
         BTreePartitionUpdater updater = fixture.apply(update);
         assertEquals(updater.heapSize, fixture.allocator.onHeap().owns() - before);
+        return updater;
     }
 
     private static List<RangeTombstone> collect(Iterator<RangeTombstone> iterator)

@@ -116,7 +116,7 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
     private ImmutableBTreeDeletionInfo withPartitionDeletion(DeletionTime deletion, BTreePartitionUpdater updater)
     {
         // BTreePartitionUpdater.merge has already established that this deletion supersedes partitionDeletion.
-        updater.onAllocatedOnHeap(EMPTY_SIZE + deletion.unsharedHeapSize());
+        updater.onAllocatedOnHeap(deletion.unsharedHeapSize() - partitionDeletion.unsharedHeapSize());
         return new ImmutableBTreeDeletionInfo(comparator, deletion, ranges, rangeComparator);
     }
 
