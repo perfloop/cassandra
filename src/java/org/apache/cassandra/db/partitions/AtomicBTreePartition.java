@@ -28,6 +28,7 @@ import org.github.jamm.Unmetered;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionInfo;
 import org.apache.cassandra.db.Slices;
@@ -146,6 +147,13 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
         public Updater(MemtableAllocator allocator, Cloner cloner, OpOrder.Group writeOp, UpdateTransaction indexer)
         {
             super(allocator, cloner, writeOp, indexer);
+        }
+
+        @Override
+        DeletionInfo mergeDeletionInfo(DeletionInfo existing, DeletionInfo update, ClusteringComparator comparator)
+        {
+            DeletionInfo merged = ImmutableBTreeDeletionInfo.tryMerge(existing, update, comparator, this);
+            return merged == null ? super.mergeDeletionInfo(existing, update, comparator) : merged;
         }
 
         Updater addAll(final PartitionUpdate update)

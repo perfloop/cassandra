@@ -21,6 +21,7 @@ import java.util.Collections;
 import java.util.Iterator;
 
 import com.google.common.base.Objects;
+import com.google.common.collect.Iterators;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.rows.EncodingStats;
@@ -132,10 +133,10 @@ public class MutableDeletionInfo implements DeletionInfo
     {
         add(newInfo.getPartitionDeletion());
 
-        // We know MutableDeletionInfo is the only impelementation and we're not mutating it, it's just to get access to the
-        // RangeTombstoneList directly.
-        assert newInfo instanceof MutableDeletionInfo;
-        RangeTombstoneList newRanges = ((MutableDeletionInfo)newInfo).ranges;
+        MutableDeletionInfo copy = newInfo instanceof MutableDeletionInfo
+                                   ? (MutableDeletionInfo) newInfo
+                                   : newInfo.mutableCopy();
+        RangeTombstoneList newRanges = copy.ranges;
 
         if (ranges == null)
             ranges = newRanges == null ? null : newRanges.copy();
@@ -244,10 +245,13 @@ public class MutableDeletionInfo implements DeletionInfo
     @Override
     public boolean equals(Object o)
     {
-        if(!(o instanceof MutableDeletionInfo))
+        if (!(o instanceof DeletionInfo))
             return false;
-        MutableDeletionInfo that = (MutableDeletionInfo)o;
-        return partitionDeletion.equals(that.partitionDeletion) && Objects.equal(ranges, that.ranges);
+
+        DeletionInfo that = (DeletionInfo) o;
+        return partitionDeletion.equals(that.getPartitionDeletion())
+               && rangeCount() == that.rangeCount()
+               && Iterators.elementsEqual(rangeIterator(false), that.rangeIterator(false));
     }
 
     @Override

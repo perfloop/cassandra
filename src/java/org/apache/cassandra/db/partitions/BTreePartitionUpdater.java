@@ -18,7 +18,9 @@
 
 package org.apache.cassandra.db.partitions;
 
+import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.DeletionInfo;
+import org.apache.cassandra.db.MutableDeletionInfo;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.ColumnData;
@@ -114,7 +116,7 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
             contextCloner = cloner;
         }
 
-        DeletionInfo newDeletionInfo = merge(current.deletionInfo, update.deletionInfo());
+        DeletionInfo newDeletionInfo = merge(current.deletionInfo, update.deletionInfo(), update.metadata().comparator);
 
         RegularAndStaticColumns columns = current.columns;
         RegularAndStaticColumns newColumns = update.columns().mergeTo(columns);
@@ -138,7 +140,7 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
         return merge(current, update);
     }
 
-    private DeletionInfo merge(DeletionInfo existing, DeletionInfo update)
+    private DeletionInfo merge(DeletionInfo existing, DeletionInfo update, ClusteringComparator comparator)
     {
         if (update.isLive() || !update.mayModify(existing))
             return existing;
@@ -149,11 +151,30 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
         if (update.hasRanges())
             update.rangeIterator(false).forEachRemaining(indexer::onRangeTombstone);
 
+        return mergeDeletionInfo(existing, update, comparator);
+    }
+
+    /**
+     * Merge deletion information for a partition update.
+     *
+     * The default path keeps the existing mutable representation. Atomic B-tree partitions specialize this
+     * package-local seam at their publication boundary when an immutable ordered-range representation is safe.
+     */
+    DeletionInfo mergeDeletionInfo(DeletionInfo existing, DeletionInfo update, ClusteringComparator comparator)
+    {
         // Like for rows, we have to clone the update in case internal buffers (when it has range tombstones) reference
         // memory we shouldn't hold into. But we don't ever store this off-heap currently so we just default to the
         // HeapAllocator (rather than using 'allocator').
-        DeletionInfo newInfo = existing.mutableCopy().add(update.clone(HeapCloner.instance));
-        onAllocatedOnHeap(newInfo.unsharedHeapSize() - existing.unsharedHeapSize());
+        MutableDeletionInfo copy = existing instanceof ImmutableBTreeDeletionInfo
+                                   ? (MutableDeletionInfo) existing.clone(HeapCloner.instance)
+                                   : existing.mutableCopy();
+        DeletionInfo newInfo = copy.add(update.clone(HeapCloner.instance));
+        // Materialization owns a full mutable range copy while the persistent source remains a separately
+        // published snapshot, so only its shared partition deletion is offset from the allocation ledger.
+        long existingSize = existing instanceof ImmutableBTreeDeletionInfo
+                            ? existing.getPartitionDeletion().unsharedHeapSize()
+                            : existing.unsharedHeapSize();
+        onAllocatedOnHeap(newInfo.unsharedHeapSize() - existingSize);
         return newInfo;
     }
 
