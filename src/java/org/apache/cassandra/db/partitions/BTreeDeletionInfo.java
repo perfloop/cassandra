@@ -78,11 +78,14 @@ final class BTreeDeletionInfo implements DeletionInfo
     /**
      * Reconciles an update into an immutable BTree-backed snapshot.
      *
-     * <p>The package-private seam owns any range bounds it retains: the update is copied before it can become part
-     * of the published snapshot.</p>
+     * <p>The package-private seam owns any range bounds it retains: mutable existing and update inputs are copied
+     * before they can become part of the published snapshot. Range ordering is validated against the supplied
+     * comparator before a BTree is built.</p>
      */
     static DeletionInfo merge(DeletionInfo existing, DeletionInfo update, ClusteringComparator comparator)
     {
+        if (!(existing instanceof BTreeDeletionInfo) && existing.hasRanges())
+            existing = existing.clone(HeapCloner.instance);
         update = update.clone(HeapCloner.instance);
         DeletionTime partitionDeletion = update.getPartitionDeletion().supersedes(existing.getPartitionDeletion())
                                           ? update.getPartitionDeletion()
@@ -135,16 +138,35 @@ final class BTreeDeletionInfo implements DeletionInfo
                                                 Iterator<RangeTombstone> ranges)
     {
         long rangesHeapSize = 0;
+        RangeTombstone previous = null;
         try (BTree.FastBuilder<RangeTombstone> builder = BTree.fastBuilder())
         {
             while (ranges.hasNext())
             {
                 RangeTombstone range = ranges.next();
+                validateRange(comparator, previous, range);
                 builder.add(range);
                 rangesHeapSize += unsharedHeapSize(range);
+                previous = range;
             }
             return new BTreeDeletionInfo(partitionDeletion, comparator, builder.build(), rangesHeapSize);
         }
+    }
+
+    private static void validateRange(ClusteringComparator comparator, RangeTombstone previous, RangeTombstone range)
+    {
+        Slice slice = range.deletedSlice();
+        if (Slice.isEmpty(comparator, slice.start(), slice.end()))
+            throw new IllegalArgumentException("Range is empty for the supplied clustering comparator");
+
+        if (previous == null)
+            return;
+
+        Slice previousSlice = previous.deletedSlice();
+        if (comparator.compare(previousSlice.start(), slice.start()) >= 0)
+            throw new IllegalArgumentException("Ranges are not strictly ordered for the supplied clustering comparator");
+        if (comparator.compare(previousSlice.end(), slice.start()) > 0)
+            throw new IllegalArgumentException("Ranges overlap for the supplied clustering comparator");
     }
 
     private BTreeDeletionInfo add(RangeTombstone addition)
@@ -404,6 +426,8 @@ final class BTreeDeletionInfo implements DeletionInfo
         private final Iterator<RangeTombstone> iterator;
         private final Slice slice;
         private final boolean reversed;
+        private boolean first = true;
+        private boolean done;
 
         private SlicedRangeIterator(Iterator<RangeTombstone> iterator, Slice slice, boolean reversed)
         {
@@ -415,40 +439,97 @@ final class BTreeDeletionInfo implements DeletionInfo
         @Override
         protected RangeTombstone computeNext()
         {
+            if (done)
+                return endOfData();
+
+            return reversed ? computeReverse() : computeForward();
+        }
+
+        private RangeTombstone computeForward()
+        {
             while (iterator.hasNext())
             {
                 RangeTombstone range = iterator.next();
-                ClusteringBound<?> start = range.deletedSlice().start();
-                ClusteringBound<?> end = range.deletedSlice().end();
+                Slice rangeSlice = range.deletedSlice();
+                ClusteringBound<?> start = rangeSlice.start();
+                ClusteringBound<?> end = rangeSlice.end();
 
-                if (!reversed)
+                // startIndex positions the iterator at the only range that can precede slice.start().
+                // Once it is consumed, canonical non-overlapping ranges all begin at or after slice.start().
+                boolean clippedStart = false;
+                if (first)
                 {
+                    first = false;
                     if (comparator.compare(end, slice.start()) <= 0)
                         continue;
-                    if (comparator.compare(start, slice.end()) >= 0)
-                        return endOfData();
-                }
-                else
-                {
-                    if (comparator.compare(start, slice.end()) >= 0)
-                        continue;
-                    if (comparator.compare(end, slice.start()) <= 0)
-                        return endOfData();
+                    if (comparator.compare(start, slice.start()) < 0)
+                    {
+                        start = slice.start();
+                        clippedStart = true;
+                    }
                 }
 
-                if (comparator.compare(start, slice.start()) < 0)
-                    start = slice.start();
+                if (comparator.compare(start, slice.end()) >= 0)
+                    return endOfData();
+
                 if (comparator.compare(slice.end(), end) < 0)
-                    end = slice.end();
-
-                if (!Slice.isEmpty(comparator, start, end))
                 {
-                    if (start == range.deletedSlice().start() && end == range.deletedSlice().end())
-                        return range;
-                    return new RangeTombstone(Slice.make(start, end), range.deletionTime());
+                    done = true;
+                    return clipped(range, start, slice.end());
                 }
+
+                return clippedStart ? clipped(range, start, end) : range;
             }
             return endOfData();
+        }
+
+        private RangeTombstone computeReverse()
+        {
+            while (iterator.hasNext())
+            {
+                RangeTombstone range = iterator.next();
+                Slice rangeSlice = range.deletedSlice();
+                ClusteringBound<?> start = rangeSlice.start();
+                ClusteringBound<?> end = rangeSlice.end();
+
+                // startIndex positions the iterator at the only range that can extend past slice.end().
+                // Once it is consumed, canonical non-overlapping ranges all end at or before slice.end().
+                boolean clippedEnd = false;
+                if (first)
+                {
+                    first = false;
+                    if (comparator.compare(start, slice.end()) >= 0)
+                        continue;
+                    if (comparator.compare(slice.end(), end) < 0)
+                    {
+                        end = slice.end();
+                        clippedEnd = true;
+                    }
+                }
+
+                if (comparator.compare(end, slice.start()) <= 0)
+                    return endOfData();
+
+                if (comparator.compare(start, slice.start()) < 0)
+                {
+                    done = true;
+                    return clipped(range, slice.start(), end);
+                }
+
+                return clippedEnd ? clipped(range, start, end) : range;
+            }
+            return endOfData();
+        }
+
+        private RangeTombstone clipped(RangeTombstone range, ClusteringBound<?> start, ClusteringBound<?> end)
+        {
+            if (Slice.isEmpty(comparator, start, end))
+                return endOfData();
+
+            Slice rangeSlice = range.deletedSlice();
+            if (start == rangeSlice.start() && end == rangeSlice.end())
+                return range;
+            return new RangeTombstone(Slice.make(start, end), range.deletionTime());
         }
     }
 }

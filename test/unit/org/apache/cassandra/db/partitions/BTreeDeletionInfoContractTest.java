@@ -18,12 +18,16 @@
  */
 package org.apache.cassandra.db.partitions;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.util.Iterator;
 
+import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.BufferClusteringBound;
 import org.apache.cassandra.db.BufferDecoratedKey;
 import org.apache.cassandra.db.Clustering;
@@ -59,30 +63,11 @@ import static org.junit.Assert.assertTrue;
  */
 public class BTreeDeletionInfoContractTest
 {
-    private static final int BTREE_PREFIX = 4096;
-
     @BeforeClass
     public static void initialize()
     {
-        DeletionInfoTransitionFixture.initialize();
-    }
-
-    @Test
-    public void largePrefixInstallsAndRetainsABTreeSnapshot()
-    {
-        DeletionInfoTransitionFixture.State state = new DeletionInfoTransitionFixture.State(BTREE_PREFIX);
-        DeletionInfo published = state.partition.deletionInfo();
-        assertBTreeSnapshot(published, "4,096-range prefix");
-
-        MutableDeletionInfo expected = state.canonicalPrefix();
-        PartitionUpdate update = state.exactBoundUpdate(DeletionInfoTransitionFixture.ExactBoundSeparation.OPPOSITE, 0);
-        expected.add(update.deletionInfo());
-        state.apply(update);
-
-        DeletionInfo actual = state.partition.deletionInfo();
-        assertBTreeSnapshot(actual, "exact-bound opposite transition");
-        assertDeletionInfo(expected, actual, state.metadata.comparator, "exact-bound opposite");
-        assertDeletionInfo(state.canonicalPrefix(), published, state.metadata.comparator, "retained prefix");
+        DatabaseDescriptor.daemonInitialization();
+        DatabaseDescriptor.setPartitionerUnsafe(ByteOrderedPartitioner.instance);
     }
 
     @Test
@@ -137,25 +122,33 @@ public class BTreeDeletionInfoContractTest
         state.apply(partitionDelete);
 
         DeletionInfo actual = state.partition.deletionInfo();
-        assertFalse("partition-only state should not need a range snapshot", actual instanceof BTreeDeletionInfo);
         assertDeletionInfo(expected, actual, state.metadata.comparator, "partition-only state");
         assertDeletionInfoContract(expected, actual, state, state.furtherRangeUpdate());
     }
 
-    @Test(expected = IllegalArgumentException.class)
-    public void btreeSnapshotRejectsAnIncompatibleClusteringComparator()
+    @Test
+    public void directMergeRejectsAnIncompatibleClusteringComparator()
     {
+        Assume.assumeTrue(btreeDeletionInfoIsAvailable());
         BoundaryState state = new BoundaryState();
         state.installPrefix();
 
-        BTreeDeletionInfo.merge(state.partition.deletionInfo(),
-                                MutableDeletionInfo.live(),
-                                new ClusteringComparator(ReversedType.getInstance(Int32Type.instance), Int32Type.instance));
+        try
+        {
+            directMerge(state.partition.deletionInfo(),
+                        MutableDeletionInfo.live(),
+                        new ClusteringComparator(ReversedType.getInstance(Int32Type.instance), Int32Type.instance));
+            throw new AssertionError("direct merge accepted an incompatible clustering comparator");
+        }
+        catch (IllegalArgumentException expected)
+        {
+        }
     }
 
     @Test
     public void directMergeClonesRangeBoundsBeforePublishingTheSnapshot()
     {
+        Assume.assumeTrue(btreeDeletionInfoIsAvailable());
         BoundaryState state = new BoundaryState();
         ByteBuffer startFirst = Int32Type.instance.decompose(4);
         ByteBuffer startSecond = Int32Type.instance.decompose(1);
@@ -167,8 +160,7 @@ public class BTreeDeletionInfoContractTest
         MutableDeletionInfo update = MutableDeletionInfo.live();
         update.add(supplied, state.metadata.comparator);
         MutableDeletionInfo expected = update.clone(HeapCloner.instance);
-        DeletionInfo actual = BTreeDeletionInfo.merge(DeletionInfo.LIVE, update, state.metadata.comparator);
-        assertBTreeSnapshot(actual, "directly merged update");
+        DeletionInfo actual = directMerge(DeletionInfo.LIVE, update, state.metadata.comparator);
 
         startFirst.putInt(0, 99);
         startSecond.putInt(0, 99);
@@ -180,10 +172,59 @@ public class BTreeDeletionInfoContractTest
         assertNull("published range followed a caller-owned buffer mutation", actual.rangeCovering(state.clustering(99, 2)));
     }
 
+    @Test
+    public void directMergeClonesExistingRangeBoundsBeforePublishingTheSnapshot()
+    {
+        Assume.assumeTrue(btreeDeletionInfoIsAvailable());
+        BoundaryState state = new BoundaryState();
+        ByteBuffer startFirst = Int32Type.instance.decompose(4);
+        ByteBuffer startSecond = Int32Type.instance.decompose(1);
+        ByteBuffer endFirst = Int32Type.instance.decompose(4);
+        ByteBuffer endSecond = Int32Type.instance.decompose(3);
+        MutableDeletionInfo existing = MutableDeletionInfo.live();
+        existing.add(new RangeTombstone(Slice.make(BufferClusteringBound.inclusiveStartOf(startFirst, startSecond),
+                                                   BufferClusteringBound.exclusiveEndOf(endFirst, endSecond)),
+                                        DeletionTime.build(300, 40)),
+                     state.metadata.comparator);
+        MutableDeletionInfo update = new MutableDeletionInfo(DeletionTime.build(400, 50));
+        MutableDeletionInfo expected = existing.clone(HeapCloner.instance);
+        expected.add(update);
+        DeletionInfo actual = directMerge(existing, update, state.metadata.comparator);
+
+        startFirst.putInt(0, 99);
+        startSecond.putInt(0, 99);
+        endFirst.putInt(0, 99);
+        endSecond.putInt(0, 99);
+
+        assertDeletionInfo(expected, actual, state.metadata.comparator, "directly merged existing bounds");
+        assertNotNull("published range no longer covers its original clustering", actual.rangeCovering(state.clustering(4, 2)));
+        assertNull("published range followed a caller-owned existing buffer mutation", actual.rangeCovering(state.clustering(99, 2)));
+    }
+
+    @Test
+    public void directMergeRejectsRangesNotOrderedByTheSuppliedComparator()
+    {
+        Assume.assumeTrue(btreeDeletionInfoIsAvailable());
+        BoundaryState state = new BoundaryState();
+        MutableDeletionInfo update = MutableDeletionInfo.live();
+        update.add(state.range(true, new int[] { 0, 0 }, false, new int[] { 0, 1 }, 300), state.metadata.comparator);
+        update.add(state.range(true, new int[] { 1, 0 }, false, new int[] { 1, 1 }, 301), state.metadata.comparator);
+
+        try
+        {
+            directMerge(DeletionInfo.LIVE,
+                        update,
+                        new ClusteringComparator(ReversedType.getInstance(Int32Type.instance), Int32Type.instance));
+            throw new AssertionError("direct merge accepted ranges ordered by a different comparator");
+        }
+        catch (IllegalArgumentException expected)
+        {
+        }
+    }
+
     private static void assertBoundaryState(MutableDeletionInfo expected, BoundaryState state, String description)
     {
         DeletionInfo actual = state.partition.deletionInfo();
-        assertBTreeSnapshot(actual, description);
         assertDeletionInfo(expected, actual, state.metadata.comparator, description);
         assertSlicesAndSearches(expected, actual, state.metadata.comparator, state.slices(), state.probes());
     }
@@ -240,10 +281,39 @@ public class BTreeDeletionInfoContractTest
         }
     }
 
-    private static void assertBTreeSnapshot(DeletionInfo deletionInfo, String description)
+    private static boolean btreeDeletionInfoIsAvailable()
     {
-        assertTrue(description + " did not install a BTree-backed deletion snapshot",
-                   deletionInfo instanceof BTreeDeletionInfo);
+        try
+        {
+            Class.forName("org.apache.cassandra.db.partitions.BTreeDeletionInfo");
+            return true;
+        }
+        catch (ClassNotFoundException e)
+        {
+            return false;
+        }
+    }
+
+    private static DeletionInfo directMerge(DeletionInfo existing, DeletionInfo update, ClusteringComparator comparator)
+    {
+        try
+        {
+            Class<?> deletionInfoClass = Class.forName("org.apache.cassandra.db.partitions.BTreeDeletionInfo");
+            Method merge = deletionInfoClass.getDeclaredMethod("merge", DeletionInfo.class, DeletionInfo.class, ClusteringComparator.class);
+            merge.setAccessible(true);
+            return (DeletionInfo) merge.invoke(null, existing, update, comparator);
+        }
+        catch (InvocationTargetException e)
+        {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException)
+                throw (RuntimeException) cause;
+            throw new AssertionError("direct merge failed", cause);
+        }
+        catch (ReflectiveOperationException e)
+        {
+            throw new AssertionError("could not invoke direct merge", e);
+        }
     }
 
     private static void assertDeletionInfo(DeletionInfo expected,
