@@ -109,7 +109,7 @@ public class ImmutableBTreeDeletionInfoTest
 
             assertLedger(fixture, fixture.partitionDelete(10));
             DeletionInfo withPartitionDeletion = fixture.partition.deletionInfo();
-            assertTrue(withPartitionDeletion instanceof ImmutableBTreeDeletionInfo);
+            assertFalse(withPartitionDeletion instanceof ImmutableBTreeDeletionInfo);
             assertEquals(10, withPartitionDeletion.getPartitionDeletion().markedForDeleteAt());
             assertEquals(3, withPartitionDeletion.rangeCount());
             expected.add(DeletionTime.build(10, LOCAL_DELETION_TIME));

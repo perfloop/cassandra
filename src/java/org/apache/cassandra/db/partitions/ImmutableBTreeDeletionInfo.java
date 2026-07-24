@@ -51,26 +51,18 @@ import org.apache.cassandra.utils.memory.HeapCloner;
  */
 final class ImmutableBTreeDeletionInfo implements DeletionInfo
 {
-    private static final long EMPTY_SIZE = ObjectSizes.measure(new ImmutableBTreeDeletionInfo(null,
-                                                                                                    DeletionTime.LIVE,
-                                                                                                    BTree.empty(),
-                                                                                                    new RangeComparator(null)));
+    private static final long EMPTY_SIZE = ObjectSizes.measure(new ImmutableBTreeDeletionInfo(null, null, null));
     private static final long RANGE_COMPARATOR_SIZE = ObjectSizes.measure(new RangeComparator(null));
     private static final long RANGE_TOMBSTONE_SIZE = ObjectSizes.measure(new RangeTombstone(null, null));
     private static final long SLICE_SIZE = ObjectSizes.measure(Slice.ALL);
 
     private final ClusteringComparator comparator;
-    private final DeletionTime partitionDeletion;
     private final Object[] ranges;
     private final RangeComparator rangeComparator;
 
-    private ImmutableBTreeDeletionInfo(ClusteringComparator comparator,
-                                       DeletionTime partitionDeletion,
-                                       Object[] ranges,
-                                       RangeComparator rangeComparator)
+    private ImmutableBTreeDeletionInfo(ClusteringComparator comparator, Object[] ranges, RangeComparator rangeComparator)
     {
         this.comparator = comparator;
-        this.partitionDeletion = partitionDeletion;
         this.ranges = ranges;
         this.rangeComparator = rangeComparator;
     }
@@ -90,9 +82,6 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
                 return ((ImmutableBTreeDeletionInfo) existing).append(range, updater);
         }
 
-        if (existing instanceof ImmutableBTreeDeletionInfo && !update.hasRanges() && !update.getPartitionDeletion().isLive())
-            return ((ImmutableBTreeDeletionInfo) existing).withPartitionDeletion(update.getPartitionDeletion(), updater);
-
         return null;
     }
 
@@ -103,7 +92,7 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
         RangeComparator rangeComparator = new RangeComparator(comparator);
         Object[] updated = BTree.update(BTree.empty(), BTree.singleton(range), rangeComparator, new RangeCloningUpdateFunction(updater));
         updater.onAllocatedOnHeap(EMPTY_SIZE + RANGE_COMPARATOR_SIZE);
-        return new ImmutableBTreeDeletionInfo(comparator, DeletionTime.LIVE, updated, rangeComparator);
+        return new ImmutableBTreeDeletionInfo(comparator, updated, rangeComparator);
     }
 
     private ImmutableBTreeDeletionInfo append(RangeTombstone range, BTreePartitionUpdater updater)
@@ -113,23 +102,11 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
 
         Object[] updated = BTree.update(ranges, BTree.singleton(range), rangeComparator, new RangeCloningUpdateFunction(updater));
         updater.onAllocatedOnHeap(EMPTY_SIZE);
-        return new ImmutableBTreeDeletionInfo(comparator, partitionDeletion, updated, rangeComparator);
-    }
-
-    private ImmutableBTreeDeletionInfo withPartitionDeletion(DeletionTime deletion, BTreePartitionUpdater updater)
-    {
-        if (!deletion.supersedes(partitionDeletion))
-            return this;
-
-        updater.onAllocatedOnHeap(EMPTY_SIZE + deletion.unsharedHeapSize());
-        return new ImmutableBTreeDeletionInfo(comparator, deletion, ranges, rangeComparator);
+        return new ImmutableBTreeDeletionInfo(comparator, updated, rangeComparator);
     }
 
     private boolean canAppend(RangeTombstone range)
     {
-        if (BTree.isEmpty(ranges))
-            return true;
-
         RangeTombstone last = BTree.findByIndex(ranges, BTree.size(ranges) - 1);
         return comparator.compare(last.deletedSlice().end(), range.deletedSlice().start()) <= 0;
     }
@@ -137,13 +114,13 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
     @Override
     public boolean isLive()
     {
-        return partitionDeletion.isLive() && BTree.isEmpty(ranges);
+        return false;
     }
 
     @Override
     public DeletionTime getPartitionDeletion()
     {
-        return partitionDeletion;
+        return DeletionTime.LIVE;
     }
 
     @Override
@@ -155,9 +132,6 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
     @Override
     public Iterator<RangeTombstone> rangeIterator(Slice slice, boolean reversed)
     {
-        if (BTree.isEmpty(ranges))
-            return Collections.emptyIterator();
-
         int size = rangeCount();
         if (!reversed)
         {
@@ -231,7 +205,7 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
     @Override
     public void collectStats(EncodingStats.Collector collector)
     {
-        collector.update(partitionDeletion);
+        collector.update(DeletionTime.LIVE);
         rangeIterator(false).forEachRemaining(range -> {
             collector.updateTimestamp(range.deletionTime().markedForDeleteAt());
             collector.updateLocalDeletionTime(range.deletionTime().localDeletionTime());
@@ -241,10 +215,7 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
     @Override
     public int dataSize()
     {
-        int size = TypeSizes.sizeof(partitionDeletion.markedForDeleteAt());
-        if (!hasRanges())
-            return size;
-
+        int size = TypeSizes.sizeof(DeletionTime.LIVE.markedForDeleteAt());
         size += TypeSizes.sizeof(rangeCount());
         Iterator<RangeTombstone> iterator = rangeIterator(false);
         while (iterator.hasNext())
@@ -260,7 +231,7 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
     @Override
     public boolean hasRanges()
     {
-        return !BTree.isEmpty(ranges);
+        return true;
     }
 
     @Override
@@ -272,7 +243,7 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
     @Override
     public long maxTimestamp()
     {
-        long max = partitionDeletion.markedForDeleteAt();
+        long max = DeletionTime.LIVE.markedForDeleteAt();
         Iterator<RangeTombstone> iterator = rangeIterator(false);
         while (iterator.hasNext())
             max = Math.max(max, iterator.next().deletionTime().markedForDeleteAt());
@@ -282,7 +253,7 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
     @Override
     public boolean mayModify(DeletionInfo deletionInfo)
     {
-        return partitionDeletion.compareTo(deletionInfo.getPartitionDeletion()) > 0 || hasRanges();
+        return true;
     }
 
     @Override
@@ -290,7 +261,7 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
     {
         RangeTombstoneList copy = new RangeTombstoneList(comparator, rangeCount());
         rangeIterator(false).forEachRemaining(copy::add);
-        return new MutableDeletionInfo(partitionDeletion, copy);
+        return new MutableDeletionInfo(DeletionTime.LIVE, copy);
     }
 
     @Override
@@ -302,7 +273,7 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
     @Override
     public long unsharedHeapSize()
     {
-        long size = EMPTY_SIZE + RANGE_COMPARATOR_SIZE + partitionDeletion.unsharedHeapSize() + BTree.sizeOnHeapOf(ranges);
+        long size = EMPTY_SIZE + RANGE_COMPARATOR_SIZE + DeletionTime.LIVE.unsharedHeapSize() + BTree.sizeOnHeapOf(ranges);
         Iterator<RangeTombstone> iterator = rangeIterator(false);
         while (iterator.hasNext())
             size += rangeHeapSize(iterator.next());
@@ -316,7 +287,7 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
             return false;
 
         DeletionInfo that = (DeletionInfo) other;
-        return partitionDeletion.equals(that.getPartitionDeletion())
+        return DeletionTime.LIVE.equals(that.getPartitionDeletion())
                && rangeCount() == that.rangeCount()
                && Iterators.elementsEqual(rangeIterator(false), that.rangeIterator(false));
     }
@@ -336,7 +307,7 @@ final class ImmutableBTreeDeletionInfo implements DeletionInfo
         }
 
         int hash = 1;
-        hash = 31 * hash + partitionDeletion.hashCode();
+        hash = 31 * hash + DeletionTime.LIVE.hashCode();
         return 31 * hash + rangesHash;
     }
 
