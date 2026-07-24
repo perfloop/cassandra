@@ -116,6 +116,29 @@ public class HarryCompactionWithRangeDeletionsTest extends CQLTester
     }
 
     @Test
+    public void testMemtableRangeDeletesThenCompact() throws Throwable
+    {
+        perTestSetup();
+        schemaChange(String.format("CREATE KEYSPACE IF NOT EXISTS %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}", keyspace));
+        schemaChange(String.format("CREATE TABLE %s (pk int, ck int, v int, PRIMARY KEY (pk, ck))", qualifiedTable));
+
+        ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(table);
+        cfs.disableAutoCompaction();
+
+        final int rangeCount = 128;
+        for (int i = 0; i < rangeCount; i++)
+            execute("INSERT INTO " + qualifiedTable + " (pk, ck, v) VALUES (?, ?, ?) USING TIMESTAMP ?", 0, i * 2, i, i + 1L);
+
+        for (int i = 0; i < rangeCount; i++)
+            execute("DELETE FROM " + qualifiedTable + " USING TIMESTAMP ? WHERE pk = ? AND ck >= ? AND ck < ?", rangeCount + i + 1L, 0, i * 2, i * 2 + 1);
+
+        assertEmpty(execute("SELECT * FROM " + qualifiedTable + " WHERE pk = ?", 0));
+        cfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
+        cfs.forceMajorCompaction();
+        assertEmpty(execute("SELECT * FROM " + qualifiedTable + " WHERE pk = ?", 0));
+    }
+
+    @Test
     public void testFlushAndCompact2() throws IOException {
         testFlushAndCompact(2);
     }
