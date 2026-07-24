@@ -132,10 +132,12 @@ public class MutableDeletionInfo implements DeletionInfo
     {
         add(newInfo.getPartitionDeletion());
 
-        // We know MutableDeletionInfo is the only impelementation and we're not mutating it, it's just to get access to the
-        // RangeTombstoneList directly.
-        assert newInfo instanceof MutableDeletionInfo;
-        RangeTombstoneList newRanges = ((MutableDeletionInfo)newInfo).ranges;
+        // A non-mutable snapshot materializes only when a caller explicitly asks to merge it into
+        // this mutable representation. Published BTree-backed snapshots remain immutable.
+        MutableDeletionInfo copy = newInfo instanceof MutableDeletionInfo
+                                   ? (MutableDeletionInfo) newInfo
+                                   : newInfo.mutableCopy();
+        RangeTombstoneList newRanges = copy.ranges;
 
         if (ranges == null)
             ranges = newRanges == null ? null : newRanges.copy();
