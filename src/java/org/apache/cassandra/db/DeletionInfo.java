@@ -27,8 +27,8 @@ import org.apache.cassandra.utils.memory.ByteBufferCloner;
  * A combination of a top-level (partition) tombstone and range tombstones describing the deletions
  * within a partition.
  * <p>
- * {@link MutableDeletionInfo} is used while building updates. Published BTree-backed partition snapshots use
- * {@link BTreeDeletionInfo}, which is immutable and retains unchanged range tombstones structurally.
+ * {@link MutableDeletionInfo} is used while building updates. Published partition snapshots may retain immutable
+ * deletion state independently of the mutable construction representation.
  * <p>
  * <b>Warning:</b> do not ever cast a {@code DeletionInfo} into a {@code MutableDeletionInfo} to mutate it!!!
  */

@@ -18,7 +18,6 @@
 
 package org.apache.cassandra.db.partitions;
 
-import org.apache.cassandra.db.BTreeDeletionInfo;
 import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.DeletionInfo;
 import org.apache.cassandra.db.RegularAndStaticColumns;

@@ -616,6 +616,19 @@ public class BTree
                              : new FullBTreeSearchIterator<>(btree, null, dir, lb, ub);
     }
 
+    /**
+     * Returns an iterator positioned at the greatest key no greater than {@code start}. When no such key exists,
+     * an ascending iterator starts at the first key and a descending iterator is empty.
+     */
+    public static <K, V extends K> Iterator<V> iteratorFromFloor(Object[] btree,
+                                                                   Comparator<? super K> comparator,
+                                                                   K start,
+                                                                   Dir dir)
+    {
+        return isLeaf(btree) ? new LeafBTreeSearchIterator<>(btree, comparator, dir, start)
+                             : new FullBTreeSearchIterator<>(btree, comparator, dir, start);
+    }
+
     public static <V> Iterable<V> iterable(Object[] btree)
     {
         return iterable(btree, ASC);
@@ -845,12 +858,7 @@ public class BTree
         }
     }
 
-    /* since we have access to binarySearch semantics within indexOf(), we can use this to implement
-     * lower/upper/floor/higher very trivially
-     *
-     * this implementation is *not* optimal; it requires two logarithmic traversals, although the second is much cheaper
-     * (having less height, and operating over only primitive arrays), and the clarity is compelling
-     */
+    /* The index-returning variants reuse findIndex. floor retains its matching key while descending the tree. */
 
     public static <V> int lowerIndex(Object[] btree, Comparator<? super V> comparator, V find)
     {
@@ -874,10 +882,25 @@ public class BTree
         return i;
     }
 
-    public static <V> V floor(Object[] btree, Comparator<? super V> comparator, V find)
+    public static <V> V floor(Object[] node, Comparator<? super V> comparator, V find)
     {
-        int i = floorIndex(btree, comparator, find);
-        return i >= 0 ? findByIndex(btree, i) : null;
+        V floor = null;
+        while (true)
+        {
+            int keyEnd = getKeyEnd(node);
+            int i = Arrays.binarySearch((V[]) node, 0, keyEnd, find, comparator);
+            if (i >= 0)
+                return (V) node[i];
+
+            i = -1 - i;
+            if (i > 0)
+                floor = (V) node[i - 1];
+
+            if (isLeaf(node))
+                return floor;
+
+            node = (Object[]) node[keyEnd + i];
+        }
     }
 
     public static <V> int higherIndex(Object[] btree, Comparator<? super V> comparator, V find)

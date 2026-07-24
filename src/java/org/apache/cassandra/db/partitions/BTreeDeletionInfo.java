@@ -9,14 +9,13 @@
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
-package org.apache.cassandra.db;
+package org.apache.cassandra.db.partitions;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -24,6 +23,16 @@ import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
 
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ClusteringBound;
+import org.apache.cassandra.db.ClusteringComparator;
+import org.apache.cassandra.db.ClusteringPrefix;
+import org.apache.cassandra.db.DeletionInfo;
+import org.apache.cassandra.db.DeletionTime;
+import org.apache.cassandra.db.MutableDeletionInfo;
+import org.apache.cassandra.db.RangeTombstone;
+import org.apache.cassandra.db.Slice;
+import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.utils.AbstractIterator;
 import org.apache.cassandra.utils.ObjectSizes;
@@ -33,11 +42,11 @@ import org.apache.cassandra.utils.memory.ByteBufferCloner;
 /**
  * An immutable deletion-info snapshot whose canonical range tombstones are held in a persistent BTree.
  *
- * <p>Updates use {@link RangeTombstoneList} to reconcile only the ranges surrounding each incoming
- * tombstone, then splice that canonical result into the tree. The tree itself is the published
+ * <p>Updates use {@link org.apache.cassandra.db.RangeTombstoneList} to reconcile only the ranges surrounding
+ * each incoming tombstone, then splice that canonical result into the tree. The tree itself is the published
  * representation; the temporary list is never retained by a snapshot.</p>
  */
-public final class BTreeDeletionInfo implements DeletionInfo
+final class BTreeDeletionInfo implements DeletionInfo
 {
     private static final long EMPTY_SIZE = ObjectSizes.measure(new BTreeDeletionInfo(DeletionTime.LIVE,
                                                                                       null,
@@ -48,7 +57,7 @@ public final class BTreeDeletionInfo implements DeletionInfo
 
     private final DeletionTime partitionDeletion;
     private final ClusteringComparator comparator;
-    private final Comparator<RangeTombstone> rangeComparator;
+    private final Comparator<Object> rangeComparator;
     private final Object[] ranges;
     private final long rangesHeapSize;
 
@@ -60,16 +69,19 @@ public final class BTreeDeletionInfo implements DeletionInfo
         this.partitionDeletion = partitionDeletion;
         this.comparator = comparator;
         this.rangeComparator = comparator == null ? null
-                                                   : (left, right) -> comparator.compare(left.deletedSlice().start(),
-                                                                                        right.deletedSlice().start());
+                                                   : (left, right) -> comparator.compare(startOf(left), startOf(right));
         this.ranges = ranges;
         this.rangesHeapSize = rangesHeapSize;
     }
 
     /**
-     * Reconciles an update into an immutable BTree-backed snapshot.
+     * Reconciles a cloned update into an immutable BTree-backed snapshot.
+     *
+     * <p>This package-private seam is used only by {@link BTreePartitionUpdater}; the updater supplies the
+     * partition's comparator and transfers a {@link ByteBufferCloner}-owned update before this method retains
+     * any range-bound references.</p>
      */
-    public static DeletionInfo merge(DeletionInfo existing, DeletionInfo update, ClusteringComparator comparator)
+    static DeletionInfo merge(DeletionInfo existing, DeletionInfo update, ClusteringComparator comparator)
     {
         DeletionTime partitionDeletion = update.getPartitionDeletion().supersedes(existing.getPartitionDeletion())
                                           ? update.getPartitionDeletion()
@@ -78,7 +90,7 @@ public final class BTreeDeletionInfo implements DeletionInfo
         if (!existing.hasRanges())
         {
             if (!update.hasRanges())
-                return new BTreeDeletionInfo(partitionDeletion, comparator, BTree.empty(), 0);
+                return partitionDeletion.equals(existing.getPartitionDeletion()) ? existing : update;
 
             return fromRanges(partitionDeletion, comparator, update.rangeIterator(false));
         }
@@ -100,15 +112,18 @@ public final class BTreeDeletionInfo implements DeletionInfo
         if (deletionInfo instanceof BTreeDeletionInfo)
         {
             BTreeDeletionInfo existing = (BTreeDeletionInfo) deletionInfo;
-            if (existing.comparator == comparator)
-            {
-                if (existing.partitionDeletion.equals(partitionDeletion))
-                    return existing;
-                return new BTreeDeletionInfo(partitionDeletion,
-                                             comparator,
-                                             existing.ranges,
-                                             existing.rangesHeapSize);
-            }
+            if (!existing.comparator.equals(comparator))
+                throw new IllegalArgumentException("Cannot merge deletion snapshots with different clustering comparators");
+
+            if (existing.partitionDeletion.equals(partitionDeletion))
+                return existing;
+
+            // A range snapshot's comparator remains the ordering authority for every structurally
+            // shared version. The updater only combines updates for one partition.
+            return new BTreeDeletionInfo(partitionDeletion,
+                                         existing.comparator,
+                                         existing.ranges,
+                                         existing.rangesHeapSize);
         }
 
         return fromRanges(partitionDeletion, comparator, deletionInfo.rangeIterator(false));
@@ -168,7 +183,7 @@ public final class BTreeDeletionInfo implements DeletionInfo
         if (BTree.isEmpty(ranges))
             return Collections.emptyList();
 
-        int start = BTree.floorIndex(ranges, rangeComparator, key(addition.deletedSlice().start()));
+        int start = BTree.floorIndex(ranges, rangeComparator, addition.deletedSlice().start());
         if (start < 0)
             start = 0;
 
@@ -209,6 +224,13 @@ public final class BTreeDeletionInfo implements DeletionInfo
         }
     }
 
+    private static ClusteringPrefix<?> startOf(Object value)
+    {
+        return value instanceof RangeTombstone
+               ? ((RangeTombstone) value).deletedSlice().start()
+               : (ClusteringPrefix<?>) value;
+    }
+
     private static long unsharedHeapSize(RangeTombstone range)
     {
         Slice slice = range.deletedSlice();
@@ -217,11 +239,6 @@ public final class BTreeDeletionInfo implements DeletionInfo
                + slice.start().unsharedHeapSize()
                + slice.end().unsharedHeapSize()
                + range.deletionTime().unsharedHeapSize();
-    }
-
-    private RangeTombstone key(ClusteringBound<?> start)
-    {
-        return new RangeTombstone(Slice.make(start, BufferClusteringBound.TOP), DeletionTime.LIVE);
     }
 
     @Override
@@ -249,48 +266,27 @@ public final class BTreeDeletionInfo implements DeletionInfo
         if (BTree.isEmpty(ranges))
             return Collections.emptyIterator();
 
-        int start = startIndex(slice);
-        int finish = finishIndex(slice);
-        if (start > finish)
-            return Collections.emptyIterator();
-
-        return new SlicedRangeIterator(BTree.iterator(ranges, start, finish, BTree.Dir.desc(reversed)),
-                                       slice,
-                                       reversed,
-                                       finish - start + 1);
-    }
-
-    private int startIndex(Slice slice)
-    {
-        if (slice.start().isBottom())
-            return 0;
-
-        int index = BTree.floorIndex(ranges, rangeComparator, key(slice.start()));
-        if (index < 0)
-            return 0;
-
-        RangeTombstone candidate = BTree.findByIndex(ranges, index);
-        return comparator.compare(slice.start(), candidate.deletedSlice().end()) < 0 ? index : index + 1;
-    }
-
-    private int finishIndex(Slice slice)
-    {
-        if (slice.end().isTop())
-            return BTree.size(ranges) - 1;
-
-        return BTree.lowerIndex(ranges, rangeComparator, key((ClusteringBound<?>) slice.end().invert()));
+        BTree.Dir direction = BTree.Dir.desc(reversed);
+        Iterator<RangeTombstone> iterator;
+        if ((!reversed && slice.start().isBottom()) || (reversed && slice.end().isTop()))
+        {
+            iterator = BTree.iterator(ranges, direction);
+        }
+        else
+        {
+            ClusteringPrefix<?> start = reversed ? slice.end() : slice.start();
+            iterator = BTree.iteratorFromFloor(ranges, rangeComparator, (Object) start, direction);
+        }
+        return new SlicedRangeIterator(iterator, slice, reversed);
     }
 
     @Override
     public RangeTombstone rangeCovering(Clustering<?> name)
     {
-        int index = BTree.floorIndex(ranges,
-                                     rangeComparator,
-                                     key(ClusteringBound.inclusiveStartOf(name)));
-        if (index < 0)
+        RangeTombstone range = (RangeTombstone) BTree.floor(ranges, rangeComparator, (Object) name);
+        if (range == null)
             return null;
 
-        RangeTombstone range = BTree.findByIndex(ranges, index);
         return comparator.compare(name, range.deletedSlice().start()) >= 0
                && comparator.compare(name, range.deletedSlice().end()) < 0 ? range : null;
     }
@@ -387,56 +383,17 @@ public final class BTreeDeletionInfo implements DeletionInfo
                + rangesHeapSize;
     }
 
-    @Override
-    public boolean equals(Object other)
-    {
-        if (!(other instanceof BTreeDeletionInfo))
-            return false;
-
-        BTreeDeletionInfo that = (BTreeDeletionInfo) other;
-        if (!partitionDeletion.equals(that.partitionDeletion) || rangeCount() != that.rangeCount())
-            return false;
-
-        Iterator<RangeTombstone> left = rangeIterator(false);
-        Iterator<RangeTombstone> right = that.rangeIterator(false);
-        while (left.hasNext())
-        {
-            if (!left.next().equals(right.next()))
-                return false;
-        }
-        return true;
-    }
-
-    @Override
-    public int hashCode()
-    {
-        int result = partitionDeletion.hashCode();
-        Iterator<RangeTombstone> iterator = rangeIterator(false);
-        while (iterator.hasNext())
-            result = 31 * result + iterator.next().hashCode();
-        return result;
-    }
-
-    @Override
-    public String toString()
-    {
-        return mutableCopy().toString();
-    }
-
     private final class SlicedRangeIterator extends AbstractIterator<RangeTombstone>
     {
         private final Iterator<RangeTombstone> iterator;
         private final Slice slice;
         private final boolean reversed;
-        private boolean first = true;
-        private int remaining;
 
-        private SlicedRangeIterator(Iterator<RangeTombstone> iterator, Slice slice, boolean reversed, int remaining)
+        private SlicedRangeIterator(Iterator<RangeTombstone> iterator, Slice slice, boolean reversed)
         {
             this.iterator = iterator;
             this.slice = slice;
             this.reversed = reversed;
-            this.remaining = remaining;
         }
 
         @Override
@@ -445,26 +402,28 @@ public final class BTreeDeletionInfo implements DeletionInfo
             while (iterator.hasNext())
             {
                 RangeTombstone range = iterator.next();
-                boolean isFirst = first;
-                first = false;
-                boolean last = --remaining == 0;
                 ClusteringBound<?> start = range.deletedSlice().start();
                 ClusteringBound<?> end = range.deletedSlice().end();
 
                 if (!reversed)
                 {
-                    if (isFirst && comparator.compare(start, slice.start()) < 0)
-                        start = slice.start();
-                    if (last && comparator.compare(slice.end(), end) < 0)
-                        end = slice.end();
+                    if (comparator.compare(end, slice.start()) <= 0)
+                        continue;
+                    if (comparator.compare(start, slice.end()) >= 0)
+                        return endOfData();
                 }
                 else
                 {
-                    if (isFirst && comparator.compare(slice.end(), end) < 0)
-                        end = slice.end();
-                    if (last && comparator.compare(start, slice.start()) < 0)
-                        start = slice.start();
+                    if (comparator.compare(start, slice.end()) >= 0)
+                        continue;
+                    if (comparator.compare(end, slice.start()) <= 0)
+                        return endOfData();
                 }
+
+                if (comparator.compare(start, slice.start()) < 0)
+                    start = slice.start();
+                if (comparator.compare(slice.end(), end) < 0)
+                    end = slice.end();
 
                 if (!Slice.isEmpty(comparator, start, end))
                 {
