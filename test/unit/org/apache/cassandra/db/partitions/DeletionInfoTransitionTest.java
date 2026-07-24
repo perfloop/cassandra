@@ -334,5 +334,11 @@ public class DeletionInfoTransitionTest
             allocations++;
             return ByteBuffer.allocate(size);
         }
+
+        @Override
+        public boolean isContextAwareCloningSupported()
+        {
+            return false;
+        }
     }
 }

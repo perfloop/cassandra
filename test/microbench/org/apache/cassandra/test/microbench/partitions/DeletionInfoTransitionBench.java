@@ -45,6 +45,7 @@ import org.apache.cassandra.db.MutableDeletionInfo;
 import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.Slice;
+import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.partitions.AtomicBTreePartition;
@@ -110,7 +111,7 @@ public class DeletionInfoTransitionBench
         PartitionUpdate exactBound;
         PartitionUpdate overlap;
         PartitionUpdate outOfOrder;
-        Slice[] slices;
+        Slices[] slices;
         Clustering<?>[] lookups;
         ColumnFilter selection;
 
@@ -183,10 +184,10 @@ public class DeletionInfoTransitionBench
     public int allSlicesAndDirections(TransitionState state, Blackhole blackhole)
     {
         int count = 0;
-        for (Slice slice : state.slices)
+        for (Slices slices : state.slices)
         {
-            count += consumeSlice(state.partition, state.selection, slice, false, blackhole);
-            count += consumeSlice(state.partition, state.selection, slice, true, blackhole);
+            count += consumeSlice(state.partition, state.selection, slices, false, blackhole);
+            count += consumeSlice(state.partition, state.selection, slices, true, blackhole);
         }
         return count;
     }
@@ -213,12 +214,12 @@ public class DeletionInfoTransitionBench
 
     private static int consumeSlice(AtomicBTreePartition partition,
                                     ColumnFilter selection,
-                                    Slice slice,
+                                    Slices slices,
                                     boolean reversed,
                                     Blackhole blackhole)
     {
         int count = 0;
-        try (UnfilteredRowIterator iterator = partition.unfilteredIterator(selection, slice, reversed))
+        try (UnfilteredRowIterator iterator = partition.unfilteredIterator(selection, slices, reversed))
         {
             while (iterator.hasNext())
             {
@@ -281,14 +282,19 @@ public class DeletionInfoTransitionBench
         return deletionInfo;
     }
 
-    private static Slice[] slices(TableMetadata metadata, int count)
+    private static Slices[] slices(TableMetadata metadata, int count)
     {
-        return new Slice[]{
-            slice(metadata, rangeStart(0), rangeEnd(1)),
-            slice(metadata, rangeStart(count / 2), rangeEnd(count / 2 + 1)),
-            slice(metadata, rangeStart(count - 2), rangeEnd(count - 1)),
-            slice(metadata, rangeEnd(count - 1) + 2, rangeEnd(count - 1) + 8)
+        return new Slices[]{
+            singletonSlice(metadata, rangeStart(0), rangeEnd(1)),
+            singletonSlice(metadata, rangeStart(count / 2), rangeEnd(count / 2 + 1)),
+            singletonSlice(metadata, rangeStart(count - 2), rangeEnd(count - 1)),
+            singletonSlice(metadata, rangeEnd(count - 1) + 2, rangeEnd(count - 1) + 8)
         };
+    }
+
+    private static Slices singletonSlice(TableMetadata metadata, int start, int end)
+    {
+        return Slices.with(metadata.comparator, slice(metadata, start, end));
     }
 
     private static Clustering<?>[] lookups(TableMetadata metadata, int count)
