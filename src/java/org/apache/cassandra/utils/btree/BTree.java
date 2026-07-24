@@ -616,19 +616,6 @@ public class BTree
                              : new FullBTreeSearchIterator<>(btree, null, dir, lb, ub);
     }
 
-    /**
-     * Returns an iterator positioned at the greatest key no greater than {@code start}. When no such key exists,
-     * an ascending iterator starts at the first key and a descending iterator is empty.
-     */
-    public static <K, V extends K> Iterator<V> iteratorFromFloor(Object[] btree,
-                                                                   Comparator<? super K> comparator,
-                                                                   K start,
-                                                                   Dir dir)
-    {
-        return isLeaf(btree) ? new LeafBTreeSearchIterator<>(btree, comparator, dir, start)
-                             : new FullBTreeSearchIterator<>(btree, comparator, dir, start);
-    }
-
     public static <V> Iterable<V> iterable(Object[] btree)
     {
         return iterable(btree, ASC);

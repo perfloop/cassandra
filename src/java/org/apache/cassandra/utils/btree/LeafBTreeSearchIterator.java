@@ -48,32 +48,6 @@ public class LeafBTreeSearchIterator<K, V> implements BTreeSearchIterator<K, V>
         rewind();
     }
 
-    LeafBTreeSearchIterator(Object[] btree, Comparator<? super K> comparator, BTree.Dir dir, K start)
-    {
-        this(btree, comparator, dir, 0, size(btree) - 1);
-        seekToFloor(start);
-    }
-
-    private void seekToFloor(K start)
-    {
-        int index = Arrays.binarySearch(keys, lowerBound, upperBound + 1, start, comparator);
-        if (index < 0)
-            index = -2 - index;
-
-        if (index < lowerBound)
-        {
-            if (!forwards)
-            {
-                hasNext = false;
-                return;
-            }
-            index = lowerBound;
-        }
-
-        nextPos = index;
-        updateHasNext();
-    }
-
     public void rewind()
     {
         nextPos = forwards ? lowerBound : upperBound;

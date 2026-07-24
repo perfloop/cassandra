@@ -19,7 +19,6 @@
 package org.apache.cassandra.db.partitions;
 
 import java.nio.ByteBuffer;
-import java.util.Comparator;
 import java.util.Iterator;
 
 import org.junit.BeforeClass;
@@ -43,7 +42,6 @@ import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
-import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.HeapCloner;
@@ -70,23 +68,6 @@ public class BTreeDeletionInfoContractTest
     }
 
     @Test
-    public void floorPositionedIteratorStartsAtTheFloor()
-    {
-        Object[] tree;
-        try (BTree.FastBuilder<Integer> builder = BTree.fastBuilder())
-        {
-            for (int value = 0; value < 128; value += 2)
-                builder.add(value);
-            tree = builder.build();
-        }
-
-        assertIteratorValues(BTree.iteratorFromFloor(tree, Comparator.naturalOrder(), 33, BTree.Dir.ASC), 32, 126, 2);
-        assertIteratorValues(BTree.iteratorFromFloor(tree, Comparator.naturalOrder(), 33, BTree.Dir.DESC), 32, 0, -2);
-        assertIteratorValues(BTree.iteratorFromFloor(tree, Comparator.naturalOrder(), -1, BTree.Dir.ASC), 0, 126, 2);
-        assertFalse(BTree.iteratorFromFloor(tree, Comparator.naturalOrder(), -1, BTree.Dir.DESC).hasNext());
-    }
-
-    @Test
     public void largePrefixInstallsAndRetainsABTreeSnapshot()
     {
         DeletionInfoTransitionFixture.State state = new DeletionInfoTransitionFixture.State(BTREE_PREFIX);
@@ -105,12 +86,25 @@ public class BTreeDeletionInfoContractTest
     }
 
     @Test
-    public void btreeSnapshotMatchesMutableOracleForBoundaryKindsAndMetadata()
+    public void btreeSnapshotMatchesMutableOracleAfterEachBoundaryTransition()
     {
+        for (boolean startInclusive : new boolean[] { false, true })
+        {
+            for (boolean endInclusive : new boolean[] { false, true })
+            {
+                BoundaryState state = new BoundaryState();
+                MutableDeletionInfo expected = state.installPrefix();
+                assertBoundaryState(expected, state, "boundary-kind prefix");
+
+                PartitionUpdate update = state.sharedEndpointOverlap(startInclusive, endInclusive);
+                expected.add(update.deletionInfo());
+                state.apply(update);
+                assertBoundaryState(expected, state, "shared endpoint " + startInclusive + '/' + endInclusive);
+            }
+        }
+
         BoundaryState state = new BoundaryState();
         MutableDeletionInfo expected = state.installPrefix();
-        assertBTreeSnapshot(state.partition.deletionInfo(), "boundary-kind prefix");
-
         for (PartitionUpdate update : new PartitionUpdate[]
         {
             state.higherTimestampOverlap(),
@@ -120,13 +114,13 @@ public class BTreeDeletionInfoContractTest
         {
             expected.add(update.deletionInfo());
             state.apply(update);
+            assertBoundaryState(expected, state, "timestamp transition " + update.deletionInfo().maxTimestamp());
         }
 
-        DeletionInfo actual = state.partition.deletionInfo();
-        assertBTreeSnapshot(actual, "boundary-kind transition");
-        assertDeletionInfo(expected, actual, state.metadata.comparator, "boundary-kind transition");
-        assertSlicesAndSearches(expected, actual, state.metadata.comparator, state.slices(), state.probes());
-        assertDeletionInfoContract(expected, actual, state, state.furtherRangeUpdate());
+        assertDeletionInfoContract(expected,
+                                   state.partition.deletionInfo(),
+                                   state,
+                                   state.furtherRangeUpdate());
     }
 
     @Test
@@ -160,7 +154,7 @@ public class BTreeDeletionInfoContractTest
     }
 
     @Test
-    public void clonedRangeBoundsRemainStableAfterTheCallerMutatesItsUpdate()
+    public void directMergeClonesRangeBoundsBeforePublishingTheSnapshot()
     {
         BoundaryState state = new BoundaryState();
         ByteBuffer startFirst = Int32Type.instance.decompose(4);
@@ -170,22 +164,28 @@ public class BTreeDeletionInfoContractTest
         RangeTombstone supplied = new RangeTombstone(Slice.make(BufferClusteringBound.inclusiveStartOf(startFirst, startSecond),
                                                                 BufferClusteringBound.exclusiveEndOf(endFirst, endSecond)),
                                                      DeletionTime.build(300, 40));
-        PartitionUpdate update = state.update(supplied);
-
-        MutableDeletionInfo expected = MutableDeletionInfo.live();
-        expected.add(state.range(true, new int[] { 4, 1 }, false, new int[] { 4, 3 }, 300), state.metadata.comparator);
-        state.apply(update);
+        MutableDeletionInfo update = MutableDeletionInfo.live();
+        update.add(supplied, state.metadata.comparator);
+        MutableDeletionInfo expected = update.clone(HeapCloner.instance);
+        DeletionInfo actual = BTreeDeletionInfo.merge(DeletionInfo.LIVE, update, state.metadata.comparator);
+        assertBTreeSnapshot(actual, "directly merged update");
 
         startFirst.putInt(0, 99);
         startSecond.putInt(0, 99);
         endFirst.putInt(0, 99);
         endSecond.putInt(0, 99);
 
-        DeletionInfo actual = state.partition.deletionInfo();
-        assertBTreeSnapshot(actual, "cloned update");
-        assertDeletionInfo(expected, actual, state.metadata.comparator, "cloned update bounds");
+        assertDeletionInfo(expected, actual, state.metadata.comparator, "directly merged update bounds");
         assertNotNull("published range no longer covers its original clustering", actual.rangeCovering(state.clustering(4, 2)));
         assertNull("published range followed a caller-owned buffer mutation", actual.rangeCovering(state.clustering(99, 2)));
+    }
+
+    private static void assertBoundaryState(MutableDeletionInfo expected, BoundaryState state, String description)
+    {
+        DeletionInfo actual = state.partition.deletionInfo();
+        assertBTreeSnapshot(actual, description);
+        assertDeletionInfo(expected, actual, state.metadata.comparator, description);
+        assertSlicesAndSearches(expected, actual, state.metadata.comparator, state.slices(), state.probes());
     }
 
     private static void assertDeletionInfoContract(MutableDeletionInfo expected,
@@ -240,16 +240,6 @@ public class BTreeDeletionInfoContractTest
         }
     }
 
-    private static void assertIteratorValues(Iterator<Integer> actual, int first, int last, int increment)
-    {
-        for (int expected = first; increment > 0 ? expected <= last : expected >= last; expected += increment)
-        {
-            assertTrue("iterator ended before " + expected, actual.hasNext());
-            assertEquals(Integer.valueOf(expected), actual.next());
-        }
-        assertFalse("iterator retained an extra value", actual.hasNext());
-    }
-
     private static void assertBTreeSnapshot(DeletionInfo deletionInfo, String description)
     {
         assertTrue(description + " did not install a BTree-backed deletion snapshot",
@@ -263,7 +253,8 @@ public class BTreeDeletionInfoContractTest
     {
         assertEquals(description + " partition deletion", expected.getPartitionDeletion(), actual.getPartitionDeletion());
         assertEquals(description + " range count", expected.rangeCount(), actual.rangeCount());
-        assertRangeIterators(expected.rangeIterator(false), actual.rangeIterator(false), comparator, description);
+        assertRangeIterators(expected.rangeIterator(false), actual.rangeIterator(false), comparator, description + " forward");
+        assertRangeIterators(expected.rangeIterator(true), actual.rangeIterator(true), comparator, description + " reverse");
     }
 
     private static void assertRangeIterators(Iterator<RangeTombstone> expected,
@@ -333,9 +324,14 @@ public class BTreeDeletionInfoContractTest
             return expected;
         }
 
+        private PartitionUpdate sharedEndpointOverlap(boolean startInclusive, boolean endInclusive)
+        {
+            return update(range(startInclusive, new int[] { 0, 1 }, endInclusive, new int[] { 1, 1 }, 100));
+        }
+
         private PartitionUpdate higherTimestampOverlap()
         {
-            return update(range(true, new int[] { 0, 1 }, false, new int[] { 1, 1 }, 100));
+            return sharedEndpointOverlap(true, false);
         }
 
         private PartitionUpdate lowerTimestampOverlap()
@@ -375,8 +371,17 @@ public class BTreeDeletionInfoContractTest
                 slice(false, new int[] { 0, 1 }, true, new int[] { 1, 1 }),
                 slice(false, new int[] { 0, 1 }, false, new int[] { 1, 1 }),
                 Slice.make(BufferClusteringBound.BOTTOM, end(false, 0, 0)),
-                Slice.make(start(false, 2), BufferClusteringBound.TOP),
-                slice(true, new int[] { 2 }, true, new int[] { 2, 1 })
+                slice(true, new int[] { 0, 0 }, true, new int[] { 0, 1 }),
+                slice(true, new int[] { 0, 1 }, true, new int[] { 0, 2 }),
+                slice(true, new int[] { 0, 2 }, true, new int[] { 1, 0 }),
+                slice(true, new int[] { 1, 0 }, true, new int[] { 1, 1 }),
+                slice(true, new int[] { 1, 1 }, true, new int[] { 1, 2 }),
+                slice(true, new int[] { 1, 2 }, true, new int[] { 2, 0 }),
+                slice(true, new int[] { 2 }, true, new int[] { 2 }),
+                slice(true, new int[] { 2, 0 }, true, new int[] { 2, 1 }),
+                slice(true, new int[] { 2, 1 }, true, new int[] { 2, 2 }),
+                slice(true, new int[] { 2, 2 }, true, new int[] { 3, 0 }),
+                Slice.make(start(false, 2), BufferClusteringBound.TOP)
             };
         }
 
@@ -384,6 +389,7 @@ public class BTreeDeletionInfoContractTest
         {
             return new Clustering[]
             {
+                clustering(-1, 0),
                 clustering(0, 0),
                 clustering(0, 1),
                 clustering(0, 2),
@@ -392,7 +398,9 @@ public class BTreeDeletionInfoContractTest
                 clustering(1, 2),
                 clustering(2, 0),
                 clustering(2, 1),
-                clustering(3, 0)
+                clustering(2, 2),
+                clustering(3, 0),
+                clustering(3, 1)
             };
         }
 

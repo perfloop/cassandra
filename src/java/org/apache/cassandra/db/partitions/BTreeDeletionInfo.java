@@ -38,6 +38,7 @@ import org.apache.cassandra.utils.AbstractIterator;
 import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.memory.ByteBufferCloner;
+import org.apache.cassandra.utils.memory.HeapCloner;
 
 /**
  * An immutable deletion-info snapshot whose canonical range tombstones are held in a persistent BTree.
@@ -75,14 +76,14 @@ final class BTreeDeletionInfo implements DeletionInfo
     }
 
     /**
-     * Reconciles a cloned update into an immutable BTree-backed snapshot.
+     * Reconciles an update into an immutable BTree-backed snapshot.
      *
-     * <p>This package-private seam is used only by {@link BTreePartitionUpdater}; the updater supplies the
-     * partition's comparator and transfers a {@link ByteBufferCloner}-owned update before this method retains
-     * any range-bound references.</p>
+     * <p>The package-private seam owns any range bounds it retains: the update is copied before it can become part
+     * of the published snapshot.</p>
      */
     static DeletionInfo merge(DeletionInfo existing, DeletionInfo update, ClusteringComparator comparator)
     {
+        update = update.clone(HeapCloner.instance);
         DeletionTime partitionDeletion = update.getPartitionDeletion().supersedes(existing.getPartitionDeletion())
                                           ? update.getPartitionDeletion()
                                           : existing.getPartitionDeletion();
@@ -266,18 +267,33 @@ final class BTreeDeletionInfo implements DeletionInfo
         if (BTree.isEmpty(ranges))
             return Collections.emptyIterator();
 
-        BTree.Dir direction = BTree.Dir.desc(reversed);
-        Iterator<RangeTombstone> iterator;
-        if ((!reversed && slice.start().isBottom()) || (reversed && slice.end().isTop()))
+        int start = startIndex(slice, reversed);
+        if (start < 0)
+            return Collections.emptyIterator();
+
+        return new SlicedRangeIterator(BTree.iterator(ranges,
+                                                       reversed ? 0 : start,
+                                                       reversed ? start : BTree.size(ranges) - 1,
+                                                       BTree.Dir.desc(reversed)),
+                                        slice,
+                                        reversed);
+    }
+
+    private int startIndex(Slice slice, boolean reversed)
+    {
+        if (!reversed)
         {
-            iterator = BTree.iterator(ranges, direction);
+            if (slice.start().isBottom())
+                return 0;
+
+            int index = BTree.floorIndex(ranges, rangeComparator, slice.start());
+            return index < 0 ? 0 : index;
         }
-        else
-        {
-            ClusteringPrefix<?> start = reversed ? slice.end() : slice.start();
-            iterator = BTree.iteratorFromFloor(ranges, rangeComparator, (Object) start, direction);
-        }
-        return new SlicedRangeIterator(iterator, slice, reversed);
+
+        if (slice.end().isTop())
+            return BTree.size(ranges) - 1;
+
+        return BTree.floorIndex(ranges, rangeComparator, slice.end());
     }
 
     @Override

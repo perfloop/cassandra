@@ -31,7 +31,6 @@ import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.btree.UpdateFunction;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.Cloner;
-import org.apache.cassandra.utils.memory.HeapCloner;
 import org.apache.cassandra.utils.memory.MemtableAllocator;
 
 /**
@@ -150,12 +149,7 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
         if (update.hasRanges())
             update.rangeIterator(false).forEachRemaining(indexer::onRangeTombstone);
 
-        // Like for rows, we have to clone the update in case internal buffers (when it has range tombstones) reference
-        // memory we shouldn't hold into. But we don't ever store this off-heap currently so we just default to the
-        // HeapAllocator (rather than using 'allocator').
-        DeletionInfo newInfo = BTreeDeletionInfo.merge(existing,
-                                                        update.clone(HeapCloner.instance),
-                                                        comparator);
+        DeletionInfo newInfo = BTreeDeletionInfo.merge(existing, update, comparator);
         onAllocatedOnHeap(newInfo.unsharedHeapSize() - existing.unsharedHeapSize());
         return newInfo;
     }

@@ -52,34 +52,6 @@ public class FullBTreeSearchIterator<K, V> extends TreeCursor<K> implements BTre
         rewind();
     }
 
-    FullBTreeSearchIterator(Object[] btree, Comparator<? super K> comparator, BTree.Dir dir, K start)
-    {
-        this(btree, comparator, dir, 0, size(btree) - 1);
-        seekToFloor(start);
-    }
-
-    private void seekToFloor(K start)
-    {
-        reset(false);
-        seekTo(start, false, true);
-        int index = cur.globalIndex();
-        if (index < lowerBound && forwards)
-        {
-            reset(true);
-            seekTo(start, true, true);
-            index = cur.globalIndex();
-        }
-
-        if (index < lowerBound || index > upperBound)
-        {
-            state = END;
-            return;
-        }
-
-        this.index = index;
-        state = (byte) (compareToLast(index) == 0 ? LAST : MIDDLE);
-    }
-
     /**
      * @return 0 if we are on the last item, 1 if we are past the last item, and -1 if we are before it
      */
