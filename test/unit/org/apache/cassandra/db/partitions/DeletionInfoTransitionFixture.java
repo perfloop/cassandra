@@ -177,10 +177,10 @@ public final class DeletionInfoTransitionFixture
                 switch (transition)
                 {
                     case ADJACENT_EXACT:
-                        updates[i] = rangesUpdate(timestamp, rangeForIndex(middle()), rangeForIndex(middle() + 1));
+                        updates[i] = rangesUpdate(timestamp, rangeForIndex(middle(), timestamp), rangeForIndex(middle() + 1, timestamp));
                         break;
                     case OPPOSITE_EXACT:
-                        updates[i] = rangesUpdate(timestamp, rangeForIndex(0), rangeForIndex(prefixRangeCount - 1));
+                        updates[i] = rangesUpdate(timestamp, rangeForIndex(0, timestamp), rangeForIndex(prefixRangeCount - 1, timestamp));
                         break;
                     case OVERLAP:
                         updates[i] = rangesUpdate(timestamp, range(rangeStart(middle()), rangeEnd(middle() + 1), timestamp));
