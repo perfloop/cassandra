@@ -49,6 +49,7 @@ import org.apache.cassandra.utils.memory.MemtableAllocator;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 public class ImmutableBTreeDeletionInfoTest
@@ -98,22 +99,28 @@ public class ImmutableBTreeDeletionInfoTest
                                      Slice.make(ClusteringBound.create(fixture.metadata.comparator, true, true, 3),
                                                 ClusteringBound.create(fixture.metadata.comparator, false, true, 7)));
 
-            MutableDeletionInfo materialized = published.mutableCopy();
-            assertEquals(published, materialized);
-            assertEquals(materialized, published);
-            assertEquals(published.hashCode(), materialized.hashCode());
+            MutableDeletionInfo composed = MutableDeletionInfo.live();
+            composed.add(published);
+            assertEquals(published, composed);
+            assertEquals(composed, published);
+            assertEquals(published.hashCode(), composed.hashCode());
 
-            materialized.updateAllTimestampAndLocalDeletionTime(100, 9);
+            composed.updateAllTimestampAndLocalDeletionTime(100, 9);
             assertEquals(2, timestamp(published, 5));
-            assertEquals(100, timestamp(materialized, 5));
+            assertEquals(100, timestamp(composed, 5));
 
             assertLedger(fixture, fixture.partitionDelete(10));
             DeletionInfo withPartitionDeletion = fixture.partition.deletionInfo();
-            assertFalse(withPartitionDeletion instanceof ImmutableBTreeDeletionInfo);
+            assertTrue(withPartitionDeletion instanceof ImmutableBTreeDeletionInfo);
             assertEquals(10, withPartitionDeletion.getPartitionDeletion().markedForDeleteAt());
             assertEquals(3, withPartitionDeletion.rangeCount());
             expected.add(DeletionTime.build(10, LOCAL_DELETION_TIME));
             assertEquals(expected.dataSize(), withPartitionDeletion.dataSize());
+
+            MutableDeletionInfo partitionDeleteMaterialized = withPartitionDeletion.mutableCopy();
+            assertEquals(withPartitionDeletion, partitionDeleteMaterialized);
+            assertEquals(partitionDeleteMaterialized, withPartitionDeletion);
+            assertEquals(withPartitionDeletion.hashCode(), partitionDeleteMaterialized.hashCode());
         }
         finally
         {
@@ -142,6 +149,39 @@ public class ImmutableBTreeDeletionInfoTest
             DeletionInfo actual = fixture.partition.deletionInfo();
             assertFalse(actual instanceof ImmutableBTreeDeletionInfo);
             assertEquals(collect(expected.rangeIterator(false)), collect(actual.rangeIterator(false)));
+        }
+        finally
+        {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void multiRangeFallbackMatchesCanonicalMutableReconciliation()
+    {
+        Fixture fixture = new Fixture();
+        try
+        {
+            MutableDeletionInfo expected = MutableDeletionInfo.live();
+            for (int i = 0; i < 4; i++)
+            {
+                fixture.apply(fixture.rangeUpdate(i * 4, i * 4 + 2, i + 1));
+                expected.add(range(fixture.metadata.comparator, i * 4, i * 4 + 2, i + 1), fixture.metadata.comparator);
+            }
+
+            fixture.apply(fixture.multiRangeUpdate(5, 12, 16, 18, 100));
+            expected.add(range(fixture.metadata.comparator, 5, 12, 100), fixture.metadata.comparator);
+            expected.add(range(fixture.metadata.comparator, 16, 18, 100), fixture.metadata.comparator);
+
+            DeletionInfo actual = fixture.partition.deletionInfo();
+            assertFalse(actual instanceof ImmutableBTreeDeletionInfo);
+            assertSameRangeIteration(expected, actual, Slice.ALL);
+            assertSameRangeIteration(expected, actual,
+                                     Slice.make(ClusteringBound.create(fixture.metadata.comparator, true, true, 3),
+                                                ClusteringBound.create(fixture.metadata.comparator, false, true, 17)));
+            assertEquals(timestamp(expected, 6), timestamp(actual, 6));
+            assertEquals(timestamp(expected, 17), timestamp(actual, 17));
+            assertNull(actual.rangeCovering(Clustering.make(Int32Type.instance.decompose(3))));
         }
         finally
         {
@@ -223,6 +263,15 @@ public class ImmutableBTreeDeletionInfoTest
         {
             PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(metadata, 0);
             builder.timestamp(timestamp).nowInSec(LOCAL_DELETION_TIME).delete();
+            return builder.build();
+        }
+
+        private PartitionUpdate multiRangeUpdate(int firstStart, int firstEnd, int secondStart, int secondEnd, long timestamp)
+        {
+            PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(metadata, 0);
+            builder.timestamp(timestamp).nowInSec(LOCAL_DELETION_TIME);
+            builder.addRangeTombstone().start(firstStart).end(firstEnd);
+            builder.addRangeTombstone().start(secondStart).end(secondEnd);
             return builder.build();
         }
 

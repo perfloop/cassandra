@@ -20,7 +20,6 @@ package org.apache.cassandra.db;
 import java.util.Collections;
 import java.util.Iterator;
 
-import com.google.common.base.Objects;
 import com.google.common.collect.Iterators;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -257,7 +256,20 @@ public class MutableDeletionInfo implements DeletionInfo
     @Override
     public final int hashCode()
     {
-        return Objects.hashCode(partitionDeletion, ranges);
+        int rangesHash = rangeCount();
+        Iterator<RangeTombstone> iterator = rangeIterator(false);
+        while (iterator.hasNext())
+        {
+            RangeTombstone range = iterator.next();
+            rangesHash += range.deletedSlice().start().hashCode() + range.deletedSlice().end().hashCode();
+            long markedAt = range.deletionTime().markedForDeleteAt();
+            rangesHash += (int) (markedAt ^ (markedAt >>> 32));
+            rangesHash += range.deletionTime().localDeletionTimeUnsignedInteger();
+        }
+
+        int hash = 1;
+        hash = 31 * hash + partitionDeletion.hashCode();
+        return 31 * hash + rangesHash;
     }
 
     @Override

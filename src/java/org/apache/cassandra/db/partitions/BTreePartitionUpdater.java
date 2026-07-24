@@ -165,16 +165,9 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
         // Like for rows, we have to clone the update in case internal buffers (when it has range tombstones) reference
         // memory we shouldn't hold into. But we don't ever store this off-heap currently so we just default to the
         // HeapAllocator (rather than using 'allocator').
-        MutableDeletionInfo copy = existing instanceof ImmutableBTreeDeletionInfo
-                                   ? (MutableDeletionInfo) existing.clone(HeapCloner.instance)
-                                   : existing.mutableCopy();
+        MutableDeletionInfo copy = existing.mutableCopy();
         DeletionInfo newInfo = copy.add(update.clone(HeapCloner.instance));
-        // Materialization owns a full mutable range copy while the persistent source remains a separately
-        // published snapshot, so only its shared partition deletion is offset from the allocation ledger.
-        long existingSize = existing instanceof ImmutableBTreeDeletionInfo
-                            ? existing.getPartitionDeletion().unsharedHeapSize()
-                            : existing.unsharedHeapSize();
-        onAllocatedOnHeap(newInfo.unsharedHeapSize() - existingSize);
+        onAllocatedOnHeap(newInfo.unsharedHeapSize() - existing.unsharedHeapSize());
         return newInfo;
     }
 
