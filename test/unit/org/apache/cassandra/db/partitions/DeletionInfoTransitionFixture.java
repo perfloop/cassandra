@@ -23,9 +23,9 @@ import java.nio.ByteBuffer;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.BufferClusteringBound;
 import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionInfo;
 import org.apache.cassandra.db.DeletionTime;
-import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.MutableDeletionInfo;
 import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.RegularAndStaticColumns;
@@ -39,6 +39,7 @@ import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.HeapCloner;
 import org.apache.cassandra.utils.memory.HeapPool;
+import org.apache.cassandra.utils.memory.MemtableAllocator;
 
 /**
  * Shared, deterministic fixtures for deletion-info transition tests and JMH benchmarks.
@@ -74,6 +75,7 @@ public final class DeletionInfoTransitionFixture
         public final int prefixRangeCount;
         public final TableMetadata metadata;
         public final DecoratedKey key;
+        public final MemtableAllocator allocator;
         public final AtomicBTreePartition partition;
 
         private final BTreePartitionData prefix;
@@ -93,7 +95,8 @@ public final class DeletionInfoTransitionFixture
             this.prefixRangeCount = prefixRangeCount;
             this.metadata = metadata();
             this.key = key();
-            this.partition = new AtomicBTreePartition(TableMetadataRef.forOfflineTools(metadata), key, POOL.newAllocator("deletion-info-transition"));
+            this.allocator = POOL.newAllocator("deletion-info-transition");
+            this.partition = new AtomicBTreePartition(TableMetadataRef.forOfflineTools(metadata), key, allocator);
 
             apply(prefixUpdate());
             this.prefix = partition.unsafeGetHolder();
@@ -109,6 +112,11 @@ public final class DeletionInfoTransitionFixture
         public void reset()
         {
             partition.unsafeSetHolder(prefix);
+        }
+
+        public MemtableAllocator newAllocator(String name)
+        {
+            return POOL.newAllocator(name);
         }
 
         public void apply(PartitionUpdate update)

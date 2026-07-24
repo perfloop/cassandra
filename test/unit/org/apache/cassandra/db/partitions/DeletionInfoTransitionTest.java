@@ -30,7 +30,14 @@ import org.apache.cassandra.db.DeletionInfo;
 import org.apache.cassandra.db.MutableDeletionInfo;
 import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.Slice;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.index.transactions.UpdateTransaction;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.ByteBufferCloner;
+import org.apache.cassandra.utils.memory.HeapCloner;
+import org.apache.cassandra.utils.memory.MemtableAllocator;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -86,6 +93,39 @@ public class DeletionInfoTransitionTest
         DeletionInfo cloned = actual.clone(cloner);
         assertTrue("clone did not materialize any range boundaries", cloner.allocations > 0);
         assertDeletionInfo(expected, cloned, state.metadata.comparator, "ByteBufferCloner materialization");
+    }
+
+    @Test
+    public void rangeTransitionAccountsAndRoundTripsThroughUnfilteredIteratorAt4096Ranges()
+    {
+        DeletionInfoTransitionFixture.State state = new DeletionInfoTransitionFixture.State(BTREE_PREFIX);
+        state.reset();
+        long before = state.allocator.onHeap().owns();
+        state.apply(state.outOfOrderUpdate(0));
+        long after = state.allocator.onHeap().owns();
+        long expectedDeletionInfoDelta = state.partition.deletionInfo().unsharedHeapSize()
+                                         - state.prefixDeletionInfo().unsharedHeapSize();
+        assertTrue("range transition must retain non-negative heap accounting", after >= 0);
+        assertEquals("range transition must account for its deletion-info heap delta",
+                     expectedDeletionInfoDelta,
+                     after - before);
+
+        MemtableAllocator replayAllocator = state.newAllocator("deletion-info-transition-replay");
+        AtomicBTreePartition replay = new AtomicBTreePartition(TableMetadataRef.forOfflineTools(state.metadata),
+                                                                state.key,
+                                                                replayAllocator);
+        OpOrder order = new OpOrder();
+        try (UnfilteredRowIterator iterator = state.partition.unfilteredIterator())
+        {
+            PartitionUpdate patch = PartitionUpdate.fromIterator(iterator, ColumnFilter.NONE);
+            replay.addAll(patch, HeapCloner.instance, order.getCurrent(), UpdateTransaction.NO_OP);
+        }
+
+        assertDeletionInfo(state.partition.deletionInfo(),
+                           replay.deletionInfo(),
+                           state.metadata.comparator,
+                           "unfiltered iterator round trip");
+        assertTrue("unfiltered iterator replay must account for live partition data", replayAllocator.onHeap().owns() > 0);
     }
 
     private static void assertTransition(DeletionInfoTransitionFixture.State state, String description, PartitionUpdate update)
