@@ -109,6 +109,19 @@ public class BTreeDeletionInfoContractTest
     }
 
     @Test
+    public void multiRangeUpdateMatchesTheMutableOracle()
+    {
+        BoundaryState state = new BoundaryState();
+        MutableDeletionInfo expected = state.installPrefix();
+        PartitionUpdate update = state.multiRangeUpdate();
+
+        expected.add(update.deletionInfo());
+        state.apply(update);
+
+        assertBoundaryState(expected, state, "multi-range transition");
+    }
+
+    @Test
     public void liveAndPartitionOnlyDeletionStatesPreserveDeletionInfoContracts()
     {
         BoundaryState state = new BoundaryState();
@@ -170,6 +183,21 @@ public class BTreeDeletionInfoContractTest
         assertDeletionInfo(expected, actual, state.metadata.comparator, "directly merged update bounds");
         assertNotNull("published range no longer covers its original clustering", actual.rangeCovering(state.clustering(4, 2)));
         assertNull("published range followed a caller-owned buffer mutation", actual.rangeCovering(state.clustering(99, 2)));
+    }
+
+    @Test
+    public void directMergeDoesNotPublishARangeLessMutableExistingInput()
+    {
+        Assume.assumeTrue(btreeDeletionInfoIsAvailable());
+        BoundaryState state = new BoundaryState();
+        MutableDeletionInfo existing = new MutableDeletionInfo(DeletionTime.build(300, 40));
+        DeletionInfo actual = directMerge(existing, MutableDeletionInfo.live(), state.metadata.comparator);
+
+        existing.add(state.range(true, new int[] { 4, 1 }, false, new int[] { 4, 3 }, 301), state.metadata.comparator);
+
+        assertFalse("published range-free state followed a caller-owned structural mutation", actual.hasRanges());
+        assertNull("published range-free state followed a caller-owned structural mutation", actual.rangeCovering(state.clustering(4, 2)));
+        assertEquals(DeletionTime.build(300, 40), actual.getPartitionDeletion());
     }
 
     @Test
@@ -417,6 +445,14 @@ public class BTreeDeletionInfoContractTest
         private PartitionUpdate furtherRangeUpdate()
         {
             return update(range(true, new int[] { 2 }, false, new int[] { 2, 2 }, 150));
+        }
+
+        private PartitionUpdate multiRangeUpdate()
+        {
+            return update(range(BufferClusteringBound.BOTTOM, end(false, 0, 0), 100),
+                          range(start(true, 1, 0), end(true, 1, 1), 101),
+                          range(start(true, 2), end(false, 2, 1), 102),
+                          range(start(false, 3, 0), BufferClusteringBound.TOP, 103));
         }
 
         private PartitionUpdate update(RangeTombstone... ranges)

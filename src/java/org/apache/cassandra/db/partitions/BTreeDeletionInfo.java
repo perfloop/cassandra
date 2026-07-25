@@ -86,7 +86,9 @@ final class BTreeDeletionInfo implements DeletionInfo
     {
         if (!(existing instanceof BTreeDeletionInfo) && existing.hasRanges())
             existing = existing.clone(HeapCloner.instance);
-        update = update.clone(HeapCloner.instance);
+        if (update.hasRanges())
+            update = update.clone(HeapCloner.instance);
+
         DeletionTime partitionDeletion = update.getPartitionDeletion().supersedes(existing.getPartitionDeletion())
                                           ? update.getPartitionDeletion()
                                           : existing.getPartitionDeletion();
@@ -94,19 +96,17 @@ final class BTreeDeletionInfo implements DeletionInfo
         if (!existing.hasRanges())
         {
             if (!update.hasRanges())
-                return partitionDeletion.equals(existing.getPartitionDeletion()) ? existing : update;
+            {
+                // A range-free MutableDeletionInfo can be retained and later structurally changed by its caller.
+                // Publish an independently owned ordinary deletion state instead of an empty BTree snapshot.
+                return new MutableDeletionInfo(partitionDeletion);
+            }
 
             return fromRanges(partitionDeletion, comparator, update.rangeIterator(false));
         }
 
         BTreeDeletionInfo result = from(existing, partitionDeletion, comparator);
-        if (!update.hasRanges())
-            return result;
-
-        Iterator<RangeTombstone> updates = update.rangeIterator(false);
-        while (updates.hasNext())
-            result = result.add(updates.next());
-        return result;
+        return update.hasRanges() ? result.addAll(update.rangeIterator(false)) : result;
     }
 
     private static BTreeDeletionInfo from(DeletionInfo deletionInfo,
@@ -169,13 +169,23 @@ final class BTreeDeletionInfo implements DeletionInfo
             throw new IllegalArgumentException("Ranges overlap for the supplied clustering comparator");
     }
 
-    private BTreeDeletionInfo add(RangeTombstone addition)
+    private BTreeDeletionInfo addAll(Iterator<RangeTombstone> additions)
     {
-        List<RangeTombstone> affected = affectedRanges(addition);
+        List<RangeTombstone> incoming = collect(additions);
+        validateRanges(comparator, incoming);
+
+        List<RangeTombstone> affected = new ArrayList<>();
+        for (RangeTombstone addition : incoming)
+            affected.addAll(affectedRanges(addition));
+
+        affected.sort((left, right) -> rangeComparator.compare(left, right));
+        affected = distinct(affected);
+
         MutableDeletionInfo canonical = MutableDeletionInfo.live();
         for (RangeTombstone range : affected)
             canonical.add(range, comparator);
-        canonical.add(addition, comparator);
+        for (RangeTombstone addition : incoming)
+            canonical.add(addition, comparator);
 
         List<RangeTombstone> replacement = collect(canonical.rangeIterator(false));
         Object[] remaining = affected.isEmpty() ? ranges
@@ -194,6 +204,32 @@ final class BTreeDeletionInfo implements DeletionInfo
                                      comparator,
                                      updated,
                                      rangesHeapSize - affectedHeapSize + replacementHeapSize);
+    }
+
+    private static List<RangeTombstone> distinct(List<RangeTombstone> ranges)
+    {
+        if (ranges.size() < 2)
+            return ranges;
+
+        List<RangeTombstone> distinct = new ArrayList<>(ranges.size());
+        RangeTombstone previous = null;
+        for (RangeTombstone range : ranges)
+        {
+            if (previous == null || previous != range)
+                distinct.add(range);
+            previous = range;
+        }
+        return distinct;
+    }
+
+    private static void validateRanges(ClusteringComparator comparator, List<RangeTombstone> ranges)
+    {
+        RangeTombstone previous = null;
+        for (RangeTombstone range : ranges)
+        {
+            validateRange(comparator, previous, range);
+            previous = range;
+        }
     }
 
     /**
